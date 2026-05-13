@@ -152,7 +152,7 @@ jobs:
             runner: ubuntu-latest
             platform: linux/amd64
           - arch: arm64
-            runner: [self-hosted, Linux, ARM64, ubuntu-latest]
+            runner: [ubuntu-latest-arm64]
             platform: linux/arm64
 
     steps:
