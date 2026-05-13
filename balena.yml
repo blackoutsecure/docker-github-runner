@@ -29,7 +29,7 @@ post-provisioning: >-
   Repository: https://github.com/blackoutsecure/docker-github-runner
   Upstream application: https://github.com/actions/runner
 
-version: 2.333.1
+version: 2.334.0
 type: sw.block
 assets:
   repository:
