@@ -1,0 +1,567 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# Tail GitHub Runner diagnostic logs (_diag/*.log) to the console so they
+# are visible in `docker logs`.  Also emits a periodic heartbeat so you can
+# confirm the runner is still alive from `docker logs` at a glance.
+#
+set -uo pipefail
+
+_log_severity() {
+    case "${1,,}" in
+        debug) echo 10 ;;
+        info)  echo 20 ;;
+        warn)  echo 30 ;;
+        error) echo 40 ;;
+        fatal) echo 50 ;;
+        *)     echo 20 ;;
+    esac
+}
+
+log() {
+    local level="$1" msg="$2"
+    local cur min
+    cur=$(_log_severity "${level}")
+    min=$(_log_severity "${LOG_LEVEL:-info}")
+    if [[ "${level,,}" != "fatal" && "${cur}" -lt "${min}" ]]; then
+        return 0
+    fi
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-gh-runner-logs[${level}]: ${msg}"
+}
+
+DIAG_DIR="/opt/runner-bin/_diag"
+
+# Seconds between the periodic HEALTH HEARTBEAT (idle + job-running). This
+# is the heavyweight banner that includes the GitHub API online probe.
+# Default 120s; override via env. Minimum 30s (anything lower is rejected
+# to avoid hammering the GitHub API and balena's per-service log rate
+# limit).
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-120}"
+if ! [[ "${HEARTBEAT_INTERVAL}" =~ ^[0-9]+$ ]] || (( HEARTBEAT_INTERVAL < 30 )); then
+    HEARTBEAT_INTERVAL=120
+fi
+
+# Seconds between mid-job JOB HEARTBEAT mini-banners (only emitted while a
+# Runner.Worker is active; suppressed when idle). Bumped from the old 30s
+# to 120s so a typical short job (<2 min) gets one heartbeat at most and
+# longer jobs still produce visible progress without spamming the console.
+# Set to 0 to disable mid-job heartbeats entirely (the next regular HEALTH
+# HEARTBEAT will still report the active worker). Minimum 30s when enabled.
+JOB_HEARTBEAT_INTERVAL="${JOB_HEARTBEAT_INTERVAL:-120}"
+if ! [[ "${JOB_HEARTBEAT_INTERVAL}" =~ ^[0-9]+$ ]]; then
+    JOB_HEARTBEAT_INTERVAL=120
+fi
+if (( JOB_HEARTBEAT_INTERVAL > 0 && JOB_HEARTBEAT_INTERVAL < 30 )); then
+    JOB_HEARTBEAT_INTERVAL=30
+fi
+
+# --- Liveness / online check tunables ---
+# How often (in heartbeat ticks) to actively probe GitHub for the runner's
+# online status when a PAT/GITHUB_TOKEN is available. 0 disables the active
+# probe (sentinel only reflects whether the listener process is alive).
+#
+# Default policy:
+#   RUNNER_EPHEMERAL=true  -> 0 (disabled). Ephemeral runners typically
+#                             complete a single job and exit before any
+#                             active probe would fire; the API call would
+#                             just burn rate-limit quota for no signal.
+#                             Listener-process liveness alone is enough.
+#   RUNNER_EPHEMERAL=false -> 1 (every heartbeat tick).
+# Override either way by setting ONLINE_PROBE_EVERY explicitly.
+if [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]]; then
+    ONLINE_PROBE_EVERY="${ONLINE_PROBE_EVERY:-0}"
+else
+    ONLINE_PROBE_EVERY="${ONLINE_PROBE_EVERY:-1}"
+fi
+
+# Number of consecutive offline detections before we escalate.
+ONLINE_FAIL_THRESHOLD="${ONLINE_FAIL_THRESHOLD:-3}"
+
+# What to do when the threshold is hit:
+#   none      -> log only, let Docker HEALTHCHECK decide
+#   restart   -> restart only the runner service via s6 (graceful)
+#   shutdown  -> tear the container down (Docker `restart: always` recovers)
+ON_OFFLINE_ACTION="${ON_OFFLINE_ACTION:-restart}"
+
+SENTINEL_DIR="/run/gh-runner"
+SENTINEL_FILE="${SENTINEL_DIR}/online"
+mkdir -p "${SENTINEL_DIR}"
+
+# Regex of internal log classes to suppress when tailing _diag/*.log.
+# These are extremely chatty and trip balena's per-service log rate limit
+# without adding signal -- they're still preserved in the diag file on disk.
+#
+# IMPORTANT: the runner log format is `[YYYY-MM-DD HH:MM:SSZ LEVEL ClassName] message`.
+# Earlier revisions of this regex had the order reversed (`CLASS LEVEL`),
+# which meant nothing was ever actually filtered -- the apparent "noise
+# control" was a no-op for years. The pattern below correctly matches
+# ` LEVEL ClassName]` with a leading space and a trailing `]` as anchors
+# (works in both gawk and mawk; `\b` is not portable across awk variants).
+#
+# NOTE: We deliberately keep ProcessInvokerWrapper *INFO* lines because in
+# Worker_*.log those contain "Starting process: ..." entries -- the only
+# easy way to see what a job is actually doing from `docker logs`. Verbose
+# /debug/trace from the same class is still dropped.
+#
+# ActionManifestManagerLegacy / ActionManifestManager INFO is the worst
+# offender at job start: each action input default-value is dumped as a
+# pretty-printed multi-line JSON object, producing 50-200+ lines of pure
+# noise per `docker/build-push-action` invocation. We drop the header AND
+# (via the awk continuation-tracking filter below) any continuation lines
+# that don't start with their own `[YYYY-MM-DD ... LEVEL]` prefix.
+# ExtensionManager / ActionCommandManager / ExecutionContext INFO are
+# similarly boilerplate "Register extension X" / "Write payload to Y".
+#
+# Worker / JobRunner / Variables INFO also dump huge value-tree JSON
+# representations of the `github`/`runner`/`job` context (each repo,
+# organization, and enterprise object expanded as `{"k":..., "v":...}`
+# nodes -- 500-2000+ lines per job start). They're sensitive too (PAT
+# scopes, repo metadata, org descriptions) so dropping them from the
+# console is also a hygiene win; the full payload is still preserved in
+# /opt/runner-bin/_diag/Worker_*.log on disk.
+NOISE_RE=' (INFO|VERB|VERBOSE|DEBUG|TRACE) (HostContext|CommandSettings|ConfigurationStore|CredentialManager|RSAFileKeyManager|UnixUtil|CommandLineParser|SystemDControlManager|RunnerService|Terminal|GitHubActionsService|ActionManifestManagerLegacy|ActionManifestManager|ExtensionManager|ActionCommandManager|ExecutionContext|JobServerQueue|Worker|JobRunner|Variables|StepsRunner|ContainerOperationProvider)]| (VERB|VERBOSE|DEBUG|TRACE) ProcessInvokerWrapper]'
+
+# Wait for the diag directory to appear (created on first runner start)
+while [[ ! -d "${DIAG_DIR}" ]]; do
+    sleep 1
+done
+
+# Wait for the Runner.Listener process to come up
+while ! pgrep -f 'Runner.Listener' >/dev/null 2>&1; do
+    sleep 1
+done
+
+STARTED_AT="$(date +%s)"
+# Only tail logs whose mtime is at/after this point (skip stale logs from
+# previous container lifetimes, which would otherwise be replayed and spam
+# the console with old errors after every restart).
+TAIL_FROM_TS="$(( STARTED_AT - 5 ))"
+
+log "info" "Runner process is live (${RUNNER_NAME:-$(hostname)}) -- listening for jobs"
+
+TAILED=""
+LAST_HEARTBEAT="${STARTED_AT}"
+HEARTBEAT_TICK=0
+OFFLINE_STREAK=0
+PREV_WORKER_PIDS=""
+JOB_ACTIVE=0
+LAST_JOB_TICK=0
+declare -A WORKER_START_TS=()
+
+# Seed the sentinel so the healthcheck doesn't flap during the start window
+date -u +'%Y-%m-%dT%H:%M:%SZ' > "${SENTINEL_FILE}"
+
+# Pre-mark all but the newest pre-existing log as already-tailed. config.sh
+# creates a transient _diag log during registration that finalises a few
+# seconds before the listener writes its own log; without this, both end
+# up in the tail set (visible as duplicate "Tailing Runner_*.log" lines and
+# replayed setup output). We keep only the most recent one -- the listener
+# log -- and let the main loop pick up any new files that appear after.
+shopt -s nullglob
+_existing_logs=( "${DIAG_DIR}"/*.log )
+shopt -u nullglob
+if (( ${#_existing_logs[@]} > 1 )); then
+    _newest=""
+    _newest_mtime=0
+    for f in "${_existing_logs[@]}"; do
+        m="$(stat -c %Y "${f}" 2>/dev/null || echo 0)"
+        if (( m > _newest_mtime )); then
+            _newest_mtime="${m}"
+            _newest="${f}"
+        fi
+    done
+    for f in "${_existing_logs[@]}"; do
+        if [[ "${f}" != "${_newest}" ]]; then
+            TAILED="${TAILED} ${f}"
+        fi
+    done
+    log "debug" "Skipping $((${#_existing_logs[@]} - 1)) pre-existing log file(s); will tail newest: ${_newest##*/}"
+fi
+
+# ---------------------------------------------------------------------------
+# Probe GitHub API for our runner's status (online/offline). Returns:
+#   0  -> runner is online
+#   1  -> runner is offline (or not found)
+#   2  -> probe skipped (no token, no API URL, or curl failure)
+# ---------------------------------------------------------------------------
+probe_runner_online() {
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    [[ -n "${auth_token}" ]] || return 2
+    [[ -n "${RUNNER_URL:-}" && -n "${RUNNER_NAME:-}" ]] || return 2
+
+    local url_path="${RUNNER_URL#https://github.com/}"
+    url_path="${url_path%/}"
+    local api_base="https://api.github.com" runners_url
+    if [[ "${url_path}" == enterprises/* ]]; then
+        runners_url="${api_base}/enterprises/${url_path#enterprises/}/actions/runners"
+    elif [[ "${url_path}" == */* ]]; then
+        runners_url="${api_base}/repos/${url_path}/actions/runners"
+    else
+        runners_url="${api_base}/orgs/${url_path}/actions/runners"
+    fi
+
+    # Search a few pages for our runner. Most installs have <100 so page 1 wins.
+    local page=1 status=""
+    while [[ "${page}" -le 5 ]]; do
+        local resp
+        resp="$(curl -fsS --max-time 6 \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${runners_url}?per_page=100&page=${page}" 2>/dev/null)" || return 2
+
+        status="$(echo "${resp}" | jq -r \
+            --arg name "${RUNNER_NAME}" \
+            '.runners[] | select(.name == $name) | .status // empty' 2>/dev/null | head -n1)"
+        if [[ -n "${status}" ]]; then
+            break
+        fi
+
+        local count
+        count="$(echo "${resp}" | jq -r '.runners | length' 2>/dev/null)"
+        [[ "${count}" -lt 100 ]] && break
+        page=$((page + 1))
+    done
+
+    if [[ "${status}" == "online" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Emit a multi-line banner describing a Runner.Worker process. Mirrors the
+# style of the init-gh-runner-config startup banner so each job stands out
+# clearly in `docker logs`.
+# ---------------------------------------------------------------------------
+emit_worker_banner() {
+    local kind="$1" pid="$2" extra="$3"  # kind: STARTED|FINISHED
+    local now_iso uptime_s parent_pid worker_log cmdline
+    now_iso="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+    parent_pid="$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ' || true)"
+    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | sed 's/  *$//')"
+    worker_log="$(ls -1t "${DIAG_DIR}"/Worker_*.log 2>/dev/null | head -n1)"
+    worker_log="${worker_log##*/}"
+    [[ -z "${worker_log}" ]] && worker_log="(pending)"
+
+    log "info" "======================================================================="
+    if [[ "${kind}" == "STARTED" ]]; then
+        log "info" "  >>> JOB STARTED on ${RUNNER_NAME:-$(hostname)}"
+    else
+        log "info" "  <<< JOB FINISHED on ${RUNNER_NAME:-$(hostname)}"
+    fi
+    log "info" "-----------------------------------------------------------------------"
+    log "info" "    Worker PID       : ${pid}"
+    [[ -n "${parent_pid}" ]] && log "info" "    Parent (Listener): ${parent_pid}"
+    log "info" "    Started At       : ${now_iso}"
+    log "info" "    Worker Log       : _diag/${worker_log}"
+    if [[ "${kind}" == "STARTED" && -n "${cmdline}" ]]; then
+        log "debug" "    Command          : ${cmdline}"
+    fi
+    [[ -n "${extra}" ]] && log "info" "    ${extra}"
+    log "info" "======================================================================="
+}
+
+# ---------------------------------------------------------------------------
+# Emit a multi-line health banner showing listener status, online check
+# result, uptime, load, disk, and per-worker breakdown. Used for both the
+# 2-minute periodic heartbeat and the 30-second mid-job mini-heartbeat.
+#
+# Args:
+#   $1 kind       : HEARTBEAT | JOB-HEARTBEAT
+#   $2 status     : idle | running job | offline
+#   $3 status_note: free-form online verification note (may be empty)
+#   $4 uptime_hr
+#   $5 uptime_min
+#   $6 worker_pids: space-separated list (may be empty)
+# ---------------------------------------------------------------------------
+emit_health_banner() {
+    local kind="$1" status="$2" status_note="$3"
+    local uptime_hr="$4" uptime_min="$5" worker_pids="$6"
+    local listener_pid load_avg disk_free disk_pct work_dir
+    local worker_count=0 child_total=0
+
+    listener_pid="$(pgrep -f 'Runner.Listener' 2>/dev/null | head -n1)"
+    [[ -z "${listener_pid}" ]] && listener_pid="(none)"
+
+    load_avg="$(awk '{printf "%s %s %s", $1, $2, $3}' /proc/loadavg 2>/dev/null)"
+    [[ -z "${load_avg}" ]] && load_avg="(unavailable)"
+
+    work_dir="${RUNNER_WORKDIR:-/config/work}"
+    if [[ -d "${work_dir}" ]]; then
+        # df -P: portable columns. Fields: filesystem size used avail use% mount
+        read -r _ _ _ disk_free disk_pct _ < <(df -P "${work_dir}" 2>/dev/null | tail -n1)
+        [[ -n "${disk_free}" ]] && disk_free="$(numfmt --to=iec --from-unit=1024 "${disk_free}" 2>/dev/null || echo "${disk_free}K")"
+    fi
+    [[ -z "${disk_free}" ]] && disk_free="(unavailable)"
+    [[ -z "${disk_pct}"  ]] && disk_pct="?"
+
+    if [[ -n "${worker_pids}" ]]; then
+        worker_count="$(echo "${worker_pids}" | wc -w)"
+        for wpid in ${worker_pids}; do
+            c="$(pgrep -P "${wpid}" 2>/dev/null | wc -l)"
+            child_total=$(( child_total + c ))
+        done
+    fi
+
+    log "info" "======================================================================="
+    if [[ "${kind}" == "JOB-HEARTBEAT" ]]; then
+        log "info" "  *** JOB HEARTBEAT (${RUNNER_NAME:-$(hostname)}) ***"
+    else
+        log "info" "  *** HEALTH HEARTBEAT (${RUNNER_NAME:-$(hostname)}) ***"
+    fi
+    log "info" "-----------------------------------------------------------------------"
+    log "info" "    Status           : ${status}"
+    [[ -n "${status_note}" ]] && \
+        log "info" "    GitHub API Check : ${status_note}"
+    log "info" "    Uptime           : ${uptime_hr}h ${uptime_min}m"
+    log "info" "    Listener PID     : ${listener_pid}"
+    log "info" "    Load Avg (1/5/15): ${load_avg}"
+    log "info" "    Work Dir         : ${work_dir} (free: ${disk_free}, used: ${disk_pct})"
+    log "info" "    Active Workers   : ${worker_count}"
+    if (( worker_count > 0 )); then
+        log "info" "    Child Processes  : ${child_total} (across all workers)"
+        local now_epoch
+        now_epoch="$(date +%s)"
+        for wpid in ${worker_pids}; do
+            local wstart="${WORKER_START_TS[$wpid]:-0}" wdur_s wdur_m wdur_sec wchildren
+            if (( wstart > 0 )); then
+                wdur_s=$(( now_epoch - wstart ))
+                wdur_m=$(( wdur_s / 60 ))
+                wdur_sec=$(( wdur_s % 60 ))
+            else
+                wdur_m=0; wdur_sec=0
+            fi
+            wchildren="$(pgrep -P "${wpid}" 2>/dev/null | wc -l)"
+            log "info" "      - Worker pid=${wpid}  elapsed=${wdur_m}m ${wdur_sec}s  children=${wchildren}"
+        done
+    fi
+    log "info" "======================================================================="
+}
+
+while true; do
+    # --- Tail new log files (only ones from the current container run) ---
+    shopt -s nullglob
+    for f in "${DIAG_DIR}"/*.log; do
+        if [[ "${TAILED}" == *"${f}"* ]]; then
+            continue
+        fi
+
+        # Skip files older than the container's startup -- those are leftovers
+        # from a previous run and would just replay old errors.
+        f_mtime="$(stat -c %Y "${f}" 2>/dev/null || echo 0)"
+        if [[ "${f_mtime}" -lt "${TAIL_FROM_TS}" ]]; then
+            continue
+        fi
+
+        TAILED="${TAILED} ${f}"
+        log "info" "Tailing ${f##*/}"
+        # Filter out chatty internal classes; keep WARN/ERR and meaningful INFO.
+        # Then apply LOG_LEVEL threshold (debug<info<warn<error<fatal) and
+        # re-emit each line with a uniform service tag and visual flags.
+        #
+        # IMPORTANT: the runner emits multi-line records for some INFO logs
+        # (notably ActionManifestManagerLegacy dumping JSON value trees).
+        # A plain `grep -v` only drops the header line and lets the JSON
+        # continuation lines through, which is what was overwhelming
+        # balena's per-service log rate limit. We use a single awk pass
+        # that tracks suppression state: when a header line matches
+        # NOISE_RE we set suppress=1, and any subsequent continuation line
+        # (no `[YYYY-MM-DD HH:MM:SSZ LEVEL` prefix of its own) inherits
+        # that state and is also dropped. The next genuine header line
+        # resets the state.
+        MIN_SEV=$(_log_severity "${LOG_LEVEL:-info}")
+        tail -n 50 -F "$f" 2>/dev/null \
+            | awk -v src="${f##*/}" -v min_sev="${MIN_SEV}" -v noise_re="${NOISE_RE}" '
+                BEGIN { suppress = 0 }
+                {
+                    # Header line = starts with a runner timestamp + level marker.
+                    # Format: [YYYY-MM-DD HH:MM:SSZ LEVEL ClassName] message
+                    is_header = ($0 ~ /^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}Z (DEBUG|TRACE|VERB|VERBOSE|INFO|WARN|WARNING|ERR|ERROR|FATAL) /)
+
+                    if (is_header) {
+                        # New record -- decide whether to suppress this one
+                        # and any continuation lines that follow.
+                        if ($0 ~ noise_re) { suppress = 1; next }
+                        suppress = 0
+                    } else {
+                        # Continuation of the previous record. Inherit
+                        # suppression so multi-line JSON dumps do not leak.
+                        if (suppress) next
+
+                        # BACKSTOP: even when the header escaped the
+                        # NOISE_RE list (a new runner version added a
+                        # class we have not seen, or upstream renamed an
+                        # existing one), continuation lines that look
+                        # like pretty-printed JSON value-tree fragments
+                        # are *never* useful in `docker logs`. They are:
+                        #   - the `Worker` context dump  ({"k":..,"v":..})
+                        #   - action manifest input/output trees
+                        #   - serialized job/step state on errors
+                        # All of them are still preserved verbatim in
+                        # _diag/Worker_*.log on disk; we only suppress
+                        # the firehose to the console (which trips
+                        # balena per-service log rate limits and leaks
+                        # PAT scopes / org metadata to log shippers).
+                        # Match: leading whitespace + one of  { } [ ] ,  or  "k":  or  "v":
+                        if ($0 ~ /^[[:space:]]*[{}\[\],]/) next
+                        if ($0 ~ /^[[:space:]]*"[a-zA-Z_]+"[[:space:]]*:[[:space:]]/) next
+                    }
+
+                    padded = " " $0 " "
+                    lvl = "info"; sev = 20
+                    if      (padded ~ /[ \[](FATAL)[ \]]/)                  { lvl="fatal"; sev=50 }
+                    else if (padded ~ /[ \[](ERR|ERROR)[ \]]/)              { lvl="error"; sev=40 }
+                    else if (padded ~ /[ \[]WARN(ING)?[ \]]/)               { lvl="warn";  sev=30 }
+                    else if (padded ~ /[ \[](VERB|VERBOSE|DEBUG|TRACE)[ \]]/) { lvl="debug"; sev=10 }
+
+                    if (sev < min_sev && lvl != "fatal") next
+
+                    cmd = "date -u +%Y-%m-%dT%H:%M:%SZ"
+                    cmd | getline ts
+                    close(cmd)
+
+                    flag = ""
+                    if      (lvl == "fatal" || lvl == "error") flag = "!! RUNNER ERROR !! "
+                    else if (lvl == "warn")                    flag = "!  RUNNER WARN  !  "
+
+                    printf "%s runner-diag[%s] (%s): %s%s\n", ts, lvl, src, flag, $0
+                    fflush()
+                }
+            ' &
+    done
+    shopt -u nullglob
+
+    # --- Worker (job) lifecycle tracking ---
+    # Detect Runner.Worker processes appearing/disappearing so the operator
+    # gets a clear "Job started"/"Job finished" line in `docker logs` even
+    # when the heartbeat cadence is slow and the diag tail is quiet.
+    CURR_WORKER_PIDS="$(pgrep -f 'Runner.Worker' 2>/dev/null | sort -n | tr '\n' ' ')"
+    CURR_WORKER_PIDS="${CURR_WORKER_PIDS% }"
+    if [[ "${CURR_WORKER_PIDS}" != "${PREV_WORKER_PIDS}" ]]; then
+        for pid in ${CURR_WORKER_PIDS}; do
+            if [[ " ${PREV_WORKER_PIDS} " != *" ${pid} "* ]]; then
+                # Record start epoch so the FINISHED banner can show duration.
+                WORKER_START_TS["${pid}"]="$(date +%s)"
+                emit_worker_banner "STARTED" "${pid}" ""
+            fi
+        done
+        for pid in ${PREV_WORKER_PIDS}; do
+            if [[ " ${CURR_WORKER_PIDS} " != *" ${pid} "* ]]; then
+                _start="${WORKER_START_TS[$pid]:-0}"
+                _dur_extra=""
+                if (( _start > 0 )); then
+                    _dur=$(( $(date +%s) - _start ))
+                    _dur_min=$(( _dur / 60 ))
+                    _dur_sec=$(( _dur % 60 ))
+                    _dur_extra="Duration         : ${_dur_min}m ${_dur_sec}s"
+                fi
+                emit_worker_banner "FINISHED" "${pid}" "${_dur_extra}"
+                unset 'WORKER_START_TS[$pid]'
+            fi
+        done
+        PREV_WORKER_PIDS="${CURR_WORKER_PIDS}"
+    fi
+
+    NOW="$(date +%s)"
+
+    # --- Mini-heartbeat while a job is running ---
+    # Fires every JOB_HEARTBEAT_INTERVAL seconds (default 120s; set to 0
+    # to disable) so a long-running job still shows progress in the
+    # console without spamming a banner every 30s.
+    if [[ -n "${CURR_WORKER_PIDS}" ]]; then
+        if (( JOB_ACTIVE == 0 )); then
+            JOB_ACTIVE=1
+            LAST_JOB_TICK="${NOW}"
+        elif (( JOB_HEARTBEAT_INTERVAL > 0 )) && (( NOW - LAST_JOB_TICK >= JOB_HEARTBEAT_INTERVAL )); then
+            LAST_JOB_TICK="${NOW}"
+            _up_s=$(( NOW - STARTED_AT ))
+            _up_m=$(( _up_s / 60 ))
+            _up_h=$(( _up_m / 60 ))
+            _up_m=$(( _up_m % 60 ))
+            emit_health_banner "JOB-HEARTBEAT" "running job" "" \
+                "${_up_h}" "${_up_m}" "${CURR_WORKER_PIDS}"
+        fi
+    else
+        JOB_ACTIVE=0
+    fi
+
+    # --- Periodic heartbeat ---
+    if (( NOW - LAST_HEARTBEAT >= HEARTBEAT_INTERVAL )); then
+        UPTIME_SECS=$(( NOW - STARTED_AT ))
+        UPTIME_MIN=$(( UPTIME_SECS / 60 ))
+        UPTIME_HR=$(( UPTIME_MIN / 60 ))
+        UPTIME_MIN=$(( UPTIME_MIN % 60 ))
+
+        HEARTBEAT_TICK=$((HEARTBEAT_TICK + 1))
+        LISTENER_ALIVE=0
+        pgrep -f 'Runner.Listener' >/dev/null 2>&1 && LISTENER_ALIVE=1
+
+        ONLINE_RESULT=2  # default: not probed
+        if (( LISTENER_ALIVE == 1 )) \
+           && (( ONLINE_PROBE_EVERY > 0 )) \
+           && (( HEARTBEAT_TICK % ONLINE_PROBE_EVERY == 0 )); then
+            probe_runner_online
+            ONLINE_RESULT=$?
+        fi
+
+        STATUS_NOTE=""
+        case "${ONLINE_RESULT}" in
+            0) STATUS_NOTE="online (verified)" ;;
+            1) STATUS_NOTE="OFFLINE per GitHub API" ;;
+            2) STATUS_NOTE="" ;;  # no API verification available
+        esac
+
+        if (( LISTENER_ALIVE == 1 )); then
+            STATUS="idle"
+            if pgrep -f 'Runner.Worker' >/dev/null 2>&1; then
+                STATUS="running job"
+            fi
+
+            # Refresh sentinel ONLY when we either (a) have no API check,
+            # or (b) the API confirms we're online. Prevents the healthcheck
+            # from believing a process-alive-but-disconnected runner is healthy.
+            if (( ONLINE_RESULT != 1 )); then
+                date -u +'%Y-%m-%dT%H:%M:%SZ' > "${SENTINEL_FILE}"
+                OFFLINE_STREAK=0
+            else
+                OFFLINE_STREAK=$((OFFLINE_STREAK + 1))
+            fi
+
+            if [[ -n "${STATUS_NOTE}" ]]; then
+                emit_health_banner "HEARTBEAT" "${STATUS}" "${STATUS_NOTE}" \
+                    "${UPTIME_HR}" "${UPTIME_MIN}" "${CURR_WORKER_PIDS}"
+            else
+                emit_health_banner "HEARTBEAT" "${STATUS}" "" \
+                    "${UPTIME_HR}" "${UPTIME_MIN}" "${CURR_WORKER_PIDS}"
+            fi
+
+            # Escalate if the API says offline for too many ticks in a row.
+            if (( OFFLINE_STREAK >= ONLINE_FAIL_THRESHOLD )); then
+                log "error" "Runner has been OFFLINE per GitHub API for ${OFFLINE_STREAK} consecutive checks (threshold: ${ONLINE_FAIL_THRESHOLD}); action=${ON_OFFLINE_ACTION}"
+                case "${ON_OFFLINE_ACTION}" in
+                    restart)
+                        log "warn" "Restarting svc-gh-runner via s6 to attempt reconnection"
+                        s6-svc -r /run/service/svc-gh-runner 2>/dev/null \
+                            || log "warn" "s6-svc restart failed; will retry on next heartbeat"
+                        OFFLINE_STREAK=0
+                        ;;
+                    shutdown)
+                        log "warn" "Shutting container down so the orchestrator can restart it"
+                        exec s6-svscanctl -t /run/service
+                        ;;
+                    none|*)
+                        # Reset streak so we don't spam the same error every tick
+                        OFFLINE_STREAK=0
+                        ;;
+                esac
+            fi
+        else
+            # Listener is gone -- don't refresh sentinel; healthcheck will fail.
+            log "warn" "Heartbeat: Runner.Listener process not found -- may be restarting"
+        fi
+        LAST_HEARTBEAT="${NOW}"
+    fi
+
+    sleep 5
+done

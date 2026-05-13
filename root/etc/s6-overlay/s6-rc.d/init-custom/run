@@ -1,0 +1,198 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# Optional one-shot init: install extra apt packages and/or run a
+# user-supplied shell script BEFORE the runner service starts.
+#
+# Runs as root (s6 init sequence). The runner service itself still drops
+# to the LSIO `abc` user (uid 911) via s6-setuidgid afterwards.
+#
+# This step is OPTIONAL. It is intentionally a no-op when none of the
+# trigger variables are set, so the default container behaviour is unchanged.
+#
+# Variables:
+#   EXTRA_APT_REPOS   Semicolon-separated apt repository lines to add to
+#                     /etc/apt/sources.list.d/extra.list before installing.
+#                     Example: "deb http://example/repo stable main"
+#   EXTRA_PACKAGES    Space-separated list of apt package names to install.
+#                     Names are validated against ^[a-z0-9][a-z0-9+.\-]+$
+#                     to prevent shell injection from untrusted env vars.
+#   EXTRA_INIT_SCRIPT Path inside the container to a shell script to run
+#                     after package installation (typically bind-mounted).
+#                     Runs with `set -e`; failure aborts container startup.
+#
+# WARNING: incompatible with read_only: true (apt needs to write to the
+# rootfs). The script aborts with a clear error if it detects a read-only
+# rootfs and EXTRA_PACKAGES is set.
+#
+# For repeated use, building a custom image (FROM blackoutsecure/docker-github-runner,
+# then RUN apt-get install ...) is dramatically faster than re-installing
+# packages on every container start (especially in ephemeral mode).
+#
+set -uo pipefail
+
+_log_severity() {
+    case "${1,,}" in
+        debug) echo 10 ;;
+        info)  echo 20 ;;
+        warn)  echo 30 ;;
+        error) echo 40 ;;
+        fatal) echo 50 ;;
+        *)     echo 20 ;;
+    esac
+}
+
+log() {
+    local level="$1"; shift
+    local cur min
+    cur=$(_log_severity "${level}")
+    min=$(_log_severity "${LOG_LEVEL:-info}")
+    if [[ "${level,,}" != "fatal" && "${cur}" -lt "${min}" ]]; then
+        return 0
+    fi
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') init-custom[${level}]: $*"
+}
+
+# Normalize: trim whitespace and treat whitespace-only values as unset.
+# Prevents accidentally enabling the step with a value like "   " (e.g.
+# from a stripped-out compose template).
+_strip() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "${s}"; }
+EXTRA_PACKAGES="$(_strip "${EXTRA_PACKAGES:-}")"
+EXTRA_APT_REPOS="$(_strip "${EXTRA_APT_REPOS:-}")"
+EXTRA_INIT_SCRIPT="$(_strip "${EXTRA_INIT_SCRIPT:-}")"
+
+# Fast-path: nothing to do -- no triggers configured. We deliberately exit
+# WITHOUT running any apt operations or sourcing any user files when all
+# three variables are empty/unset, so a default deployment cannot be
+# tricked into running unexpected code via this hook.
+if [[ -z "${EXTRA_PACKAGES}" && -z "${EXTRA_APT_REPOS}" && -z "${EXTRA_INIT_SCRIPT}" ]]; then
+    log "debug" "init-custom: no EXTRA_* triggers set, skipping (no-op)"
+    exit 0
+fi
+
+# Repos alone, no packages, is almost certainly a misconfiguration: we'd
+# write the apt sources but never install anything. Warn and skip cleanly.
+if [[ -n "${EXTRA_APT_REPOS}" && -z "${EXTRA_PACKAGES}" ]]; then
+    log "warn" "EXTRA_APT_REPOS is set but EXTRA_PACKAGES is empty -- apt sources will not be added"
+    EXTRA_APT_REPOS=""
+    if [[ -z "${EXTRA_INIT_SCRIPT}" ]]; then
+        log "debug" "init-custom: nothing left to do, skipping"
+        exit 0
+    fi
+fi
+
+# LSIO non-root mode (https://docs.linuxserver.io/misc/non-root/) -- when the
+# container is started with `--user <uid>:<gid>`, init no longer runs as root,
+# so apt and arbitrary EXTRA_INIT_SCRIPT actions cannot be performed.
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if [[ -n "${EXTRA_PACKAGES:-}" || -n "${EXTRA_APT_REPOS:-}" ]]; then
+        log "warn" "Container is running as non-root (--user) -- EXTRA_PACKAGES/EXTRA_APT_REPOS are ignored"
+        log "warn" "Build a custom image (FROM blackoutsecure/docker-github-runner + RUN apt-get install ...) instead"
+    fi
+    if [[ -n "${EXTRA_INIT_SCRIPT:-}" ]]; then
+        log "warn" "EXTRA_INIT_SCRIPT will run as the non-root user; root-only actions inside the script will fail"
+    fi
+    # Fall through and still run EXTRA_INIT_SCRIPT (it can still do non-root work).
+    EXTRA_PACKAGES=""
+    EXTRA_APT_REPOS=""
+fi
+
+# Detect a read-only rootfs early -- apt cannot work in that case.
+if [[ -n "${EXTRA_PACKAGES:-}" ]]; then
+    if ! ( : > /etc/.init-custom.rwtest ) 2>/dev/null; then
+        log "fatal" "EXTRA_PACKAGES is set but the container rootfs is read-only."
+        log "fatal" "Either remove read_only: true from your compose file, or"
+        log "fatal" "build a custom image: FROM ${IMAGE_NAME:-blackoutsecure/docker-github-runner} + RUN apt-get install ..."
+        exit 1
+    fi
+    rm -f /etc/.init-custom.rwtest
+fi
+
+# ---------------------------------------------------------------------------
+# Optional: add extra apt repositories
+# ---------------------------------------------------------------------------
+if [[ -n "${EXTRA_APT_REPOS:-}" ]]; then
+    log "info" "Adding extra apt repositories"
+    : > /etc/apt/sources.list.d/extra.list
+    # Split on ';' -- each entry is a full apt sources line
+    IFS=';' read -ra _repos <<< "${EXTRA_APT_REPOS}"
+    for repo in "${_repos[@]}"; do
+        repo="$(echo "${repo}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -z "${repo}" ]] && continue
+        echo "${repo}" >> /etc/apt/sources.list.d/extra.list
+        log "info" "  + ${repo}"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Optional: install extra apt packages
+# ---------------------------------------------------------------------------
+if [[ -n "${EXTRA_PACKAGES:-}" ]]; then
+    # Validate each package name against a strict whitelist so that an
+    # attacker-controlled EXTRA_PACKAGES cannot inject shell commands.
+    PKG_RE='^[a-z0-9][a-z0-9+.\-]+$'
+    declare -a _safe_pkgs=()
+    for pkg in ${EXTRA_PACKAGES}; do
+        if [[ "${pkg}" =~ ${PKG_RE} ]]; then
+            _safe_pkgs+=("${pkg}")
+        else
+            log "fatal" "EXTRA_PACKAGES contains an invalid package name: '${pkg}'"
+            log "fatal" "Allowed pattern: ${PKG_RE} (lowercase letters, digits, +, ., -)"
+            exit 1
+        fi
+    done
+
+    if (( ${#_safe_pkgs[@]} == 0 )); then
+        log "warn" "EXTRA_PACKAGES was set but contained no valid package names"
+    else
+        log "info" "Installing ${#_safe_pkgs[@]} extra package(s): ${_safe_pkgs[*]}"
+        export DEBIAN_FRONTEND=noninteractive
+        if ! apt-get update -o Acquire::Retries=3 >/tmp/init-custom-apt.log 2>&1; then
+            log "fatal" "apt-get update failed -- see container logs"
+            cat /tmp/init-custom-apt.log
+            exit 1
+        fi
+        if ! apt-get install -y --no-install-recommends "${_safe_pkgs[@]}" \
+                >>/tmp/init-custom-apt.log 2>&1; then
+            log "fatal" "apt-get install failed for: ${_safe_pkgs[*]}"
+            cat /tmp/init-custom-apt.log
+            exit 1
+        fi
+        log "info" "Extra packages installed successfully"
+        rm -rf /var/lib/apt/lists/* /tmp/init-custom-apt.log
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Optional: run a user-provided init script
+# ---------------------------------------------------------------------------
+if [[ -n "${EXTRA_INIT_SCRIPT:-}" ]]; then
+    if [[ ! -f "${EXTRA_INIT_SCRIPT}" ]]; then
+        log "fatal" "EXTRA_INIT_SCRIPT is set to '${EXTRA_INIT_SCRIPT}' but the file does not exist"
+        exit 1
+    fi
+    if [[ ! -r "${EXTRA_INIT_SCRIPT}" ]]; then
+        log "fatal" "EXTRA_INIT_SCRIPT '${EXTRA_INIT_SCRIPT}' is not readable"
+        exit 1
+    fi
+
+    # Security: refuse to execute world-writable scripts. Anyone with shell
+    # access to a writable mount could otherwise pivot to root in the
+    # container by editing the script between starts.
+    _perms="$(stat -c '%a' "${EXTRA_INIT_SCRIPT}" 2>/dev/null || echo 000)"
+    if [[ "${_perms: -1}" =~ [2367] ]]; then
+        log "fatal" "EXTRA_INIT_SCRIPT '${EXTRA_INIT_SCRIPT}' is world-writable (mode ${_perms}); refusing to execute"
+        log "fatal" "Fix on host: chmod o-w '${EXTRA_INIT_SCRIPT}'"
+        exit 1
+    fi
+
+    log "info" "Running user init script: ${EXTRA_INIT_SCRIPT} (mode ${_perms})"
+    # Run under bash with -e so a failing command aborts container startup.
+    if ! bash -e "${EXTRA_INIT_SCRIPT}"; then
+        log "fatal" "User init script failed: ${EXTRA_INIT_SCRIPT}"
+        exit 1
+    fi
+    log "info" "User init script completed successfully"
+fi
+
+log "info" "Custom init complete"

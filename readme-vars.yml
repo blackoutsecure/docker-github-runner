@@ -1,0 +1,169 @@
+---
+# project information
+project_name: gh-runner
+project_url: "https://github.com/actions/runner"
+project_logo: ""
+project_blurb: "[GitHub Actions Runner]({{ project_url }}) is the self-hosted runner application for GitHub Actions. This image is an unofficial community container built in a LinuxServer.io-style pattern, with hardened runtime defaults, s6 process supervision, and ephemeral mode support. Supports Balena deployment for IoT/edge devices. Sponsored and maintained by Blackout Secure (https://blackoutsecure.app)."
+project_lsio_github_repo_url: "https://github.com/blackoutsecure/docker-github-runner"
+project_categories: "CI/CD,DevOps,Automation"
+
+# supported architectures
+available_architectures:
+  - {arch: "{{ arch_x86_64 }}", tag: "amd64-latest"}
+  - {arch: "{{ arch_arm64 }}", tag: "arm64v8-latest"}
+
+# common parameters
+common_param_env_vars_enabled: true
+param_container_name: "{{ project_name }}"
+param_usage_include_vols: true
+param_volumes:
+  - {vol_path: "/config", vol_host_path: "/path/to/runner/config", desc: "Runner configuration and persistent data"}
+
+param_usage_include_net: false
+param_usage_include_env: true
+param_env_vars:
+  - {env_var: "TZ", env_value: "Etc/UTC", desc: "Timezone (see TZ database)"}
+  - {env_var: "RUNNER_URL", env_value: "https://github.com/OWNER/REPO", desc: "GitHub repository, organization, or enterprise URL for runner registration (required)"}
+  - {env_var: "RUNNER_TOKEN", env_value: "", desc: "Runner registration token from GitHub (required if GITHUB_PAT not set, expires in 1h)"}
+  - {env_var: "GITHUB_PAT", env_value: "", desc: "GitHub Personal Access Token — auto-generates registration tokens via API (recommended, required if RUNNER_TOKEN not set)"}
+  - {env_var: "GITHUB_TOKEN", env_value: "", desc: "GitHub repo secret or App token — auto-generates registration tokens via API (alternative to GITHUB_PAT, e.g. from ${{ secrets.RUNNER_PAT }} in workflows)"}
+  - {env_var: "LOG_LEVEL", env_value: "info", desc: "Minimum log verbosity: debug, info (default), warn, error, fatal"}
+
+# optional env variables
+opt_param_usage_include_env: true
+opt_param_env_vars:
+  - {env_var: "RUNNER_NAME", env_value: "", desc: "Runner name (defaults to container hostname; auto-deduplicated if already online)"}
+  - {env_var: "RUNNER_LABELS", env_value: "", desc: "Comma-separated custom labels (e.g. self-hosted,linux,x64,gpu)"}
+  - {env_var: "RUNNER_GROUP", env_value: "", desc: "Runner group (org/enterprise only; created via API if missing, defaults to Default)"}
+  - {env_var: "RUNNER_WORKDIR", env_value: "/config/work", desc: "Working directory for runner jobs"}
+  - {env_var: "RUNNER_EPHEMERAL", env_value: "false", desc: "Run in ephemeral mode — runner exits after one job (for autoscaling)"}
+  - {env_var: "RUNNER_REPLACE_EXISTING", env_value: "true", desc: "Replace any existing runner with the same name"}
+  - {env_var: "DISABLE_RUNNER_UPDATE", env_value: "false", desc: "Disable automatic runner updates (recommended with read_only: true)"}
+  - {env_var: "RUNNER_TOKEN_FILE", env_value: "", desc: "Path to file containing RUNNER_TOKEN (Docker secrets / Kubernetes projected volumes)"}
+  - {env_var: "RUNNER_URL_FILE", env_value: "", desc: "Path to file containing RUNNER_URL"}
+  - {env_var: "GITHUB_PAT_FILE", env_value: "", desc: "Path to file containing GITHUB_PAT"}
+  - {env_var: "GITHUB_TOKEN_FILE", env_value: "", desc: "Path to file containing GITHUB_TOKEN"}
+  - {env_var: "RUNNER_ENV_FILE", env_value: "", desc: "Path to env file (KEY=VALUE per line) loaded into runner job environment. Use to inject GitHub repo secrets."}
+  - {env_var: "RUNNER_SECRETS_DIR", env_value: "", desc: "Path to directory of secret files (filename=env var, contents=value). Works with Docker Compose secrets and Kubernetes projected volumes."}
+  - {env_var: "EXTRA_PACKAGES", env_value: "", desc: "Space-separated apt packages installed at startup as root (escape hatch — for repeated use, build a custom image; incompatible with read_only: true)"}
+  - {env_var: "EXTRA_APT_REPOS", env_value: "", desc: "Semicolon-separated apt sources lines added before installing EXTRA_PACKAGES"}
+  - {env_var: "EXTRA_INIT_SCRIPT", env_value: "", desc: "Path inside container to a shell script (typically bind-mounted) run as root before the runner starts"}
+  - {env_var: "DOCKER_IN_DOCKER", env_value: "false", desc: "Enable container-based jobs: binds the runner user to the gid of the mounted /var/run/docker.sock and auto-appends a `docker` runner label. Requires bind-mounting /var/run/docker.sock. Default false because it grants the runner significant host privileges."}
+  - {env_var: "ONLINE_PROBE_EVERY", env_value: "1", desc: "Verify runner is online with GitHub every N heartbeats (~2 min each); 0 disables (requires GITHUB_PAT or GITHUB_TOKEN)"}
+  - {env_var: "ONLINE_FAIL_THRESHOLD", env_value: "3", desc: "Consecutive offline detections before triggering ON_OFFLINE_ACTION"}
+  - {env_var: "ON_OFFLINE_ACTION", env_value: "restart", desc: "Action when offline threshold trips: none | restart (s6-svc -r) | shutdown (container exit)"}
+  - {env_var: "HEALTH_STALE_AFTER", env_value: "300", desc: "Seconds before the Docker HEALTHCHECK reports unhealthy if the online sentinel goes stale"}
+  - {env_var: "CLEANUP_OFFLINE_RUNNERS", env_value: "false", desc: "Master toggle for the startup sweep that DELETEs offline runners from GitHub. Requires GITHUB_PAT/GITHUB_TOKEN with the same scope used for registration."}
+  - {env_var: "CLEANUP_OFFLINE_AFTER", env_value: "86400", desc: "Seconds a runner must be continuously offline before removal (threshold mode). Minimum 300 (5 min); default 86400 (24 h). Ignored when immediate mode is active."}
+  - {env_var: "CLEANUP_OFFLINE_IMMEDIATE", env_value: "", desc: "When 'true', skip the offline-since timer and remove any currently-offline runner. Empty = auto: true when RUNNER_EPHEMERAL=true, false otherwise. The runner this container is about to register is always skipped."}
+  - {env_var: "CLEANUP_OFFLINE_NAME_REGEX", env_value: "", desc: "Optional ERE pattern restricting cleanup to runners whose names match (e.g. '^aada' for ephemeral hash-named runners)."}
+  - {env_var: "CLEANUP_OFFLINE_DRY_RUN", env_value: "false", desc: "When 'true', log what would be removed without calling DELETE. Recommended for the first deploy after enabling cleanup."}
+  - {env_var: "CLEANUP_OFFLINE_MAX", env_value: "25", desc: "Maximum number of runners (count, not a duration) removed per startup sweep. Safety brake against an accidental mass-delete."}
+  - {env_var: "S6_SERVICES_GRACETIME", env_value: "30000", desc: "s6 service shutdown gracetime (ms) — must allow time for the runner to deregister from GitHub"}
+  - {env_var: "S6_KILL_GRACETIME", env_value: "30000", desc: "s6 hard-kill gracetime (ms) — keep aligned with stop_grace_period in compose"}
+  - {env_var: "PUID", env_value: "1000", desc: "User ID for file ownership (LinuxServer.io base image standard; ignored when read_only: true)"}
+  - {env_var: "PGID", env_value: "1000", desc: "Group ID for file ownership (LinuxServer.io base image standard; ignored when read_only: true)"}
+
+# optional parameters
+optional_parameters: |
+  For Docker-in-Docker support (container-based GitHub Actions):
+
+  ```
+    -v /var/run/docker.sock:/var/run/docker.sock
+  ```
+
+# application setup block
+app_setup_block_enabled: true
+app_setup_block: |
+  The container runs the GitHub Actions self-hosted runner with s6 process supervision.
+
+  **Registration Token**: Generate a registration token from your repository or organization:
+  - Repository: Settings > Actions > Runners > New self-hosted runner
+  - Organization: Settings > Actions > Runners > New runner
+  - API: `curl -X POST -H "Authorization: token GITHUB_PAT" https://api.github.com/repos/OWNER/REPO/actions/runners/registration-token`
+
+  **Ephemeral Mode**: Set `RUNNER_EPHEMERAL=true` for autoscaling workflows. The runner will
+  accept one job, execute it, then the container shuts down. Combine with container
+  orchestration (Docker Compose restart policy, Kubernetes, etc.) for automatic replacement.
+
+  **Docker-in-Docker**: Mount the Docker socket (`/var/run/docker.sock`) to enable
+  container-based GitHub Actions (e.g. `uses: docker://image`).
+
+  **Health Monitoring**: The image includes a Docker `HEALTHCHECK` that combines
+  process liveness with an active "online" sentinel refreshed by the heartbeat
+  service. When `GITHUB_PAT` (or `GITHUB_TOKEN`) is provided, the heartbeat also
+  queries the GitHub API to verify the runner shows as `online`. If it stays
+  offline for `ONLINE_FAIL_THRESHOLD` consecutive checks the container takes
+  `ON_OFFLINE_ACTION` (default: restart the s6 service). Container restart
+  policies (`restart: always`) handle the rest.
+
+  **Stale Offline Runner Cleanup**: Crashes, SIGKILL, host reboots, and ephemeral
+  job exits all leave a runner registered as `offline` in GitHub. Set
+  `CLEANUP_OFFLINE_RUNNERS=true` (and provide a `GITHUB_PAT`/`GITHUB_TOKEN`) to
+  have the container DELETE offline runners via the API at startup. By default
+  `CLEANUP_OFFLINE_IMMEDIATE` auto-resolves to `true` when `RUNNER_EPHEMERAL=true`
+  (offline ephemeral runners are dead by definition, so no grace timer is
+  needed) and `false` otherwise (persistent runners get a `CLEANUP_OFFLINE_AFTER`
+  grace window — default 24 h — so a network blip can't trigger removal). The
+  runner this container is about to register is always skipped, and
+  `CLEANUP_OFFLINE_MAX` (default 25) caps removals per sweep. Use
+  `CLEANUP_OFFLINE_DRY_RUN=true` for the first deploy to preview what would be
+  removed.
+
+  **Read-Only Mode**: Ephemeral runners support `read_only: true`. The runner is
+  installed to the immutable `/opt/runner-bin`; at startup an init step populates
+  `/opt/actions-runner` (mounted as `tmpfs` only when needed for `read_only:true`)
+  with hard links — or full copies when the runtime path is on a different
+  filesystem. **Do not mount a tmpfs or volume at `/opt/actions-runner` unless
+  you actually need read-only mode**, otherwise every cold start re-copies
+  ~200 MB of runner binaries; see the Cold-start performance section in the
+  README. Set `DISABLE_RUNNER_UPDATE=true` when running read-only since
+  auto-updates can't persist across container restarts.
+
+  **Balena Deployment**: This image supports deployment to Balena-powered IoT and edge
+  devices using `balena push <your-app-slug>`. See the `balena.yml` file and
+  [Balena documentation](https://docs.balena.io/) for details.
+
+# hardware acceleration
+readme_hwaccel: false
+
+# read-only support
+readonly_supported: true
+readonly_message: |
+  Read-only operation is supported in **ephemeral mode**. The runner install
+  lives at the immutable `/opt/runner-bin`; the runtime directory
+  `/opt/actions-runner` must be mounted as `tmpfs` so the runner can write its
+  registration files and `_diag/_work` directories. Required tmpfs mounts:
+
+  - `/run:exec` — required by s6-overlay
+  - `/tmp:exec`
+  - `/var/log`
+  - `/opt/actions-runner:exec` — runtime tree + state (only mount when `read_only: true`; see note below)
+  - `/config:exec` — ephemeral state and work dir
+  - `/run/gh-runner` — healthcheck sentinel (auto-created inside the `/run` tmpfs)
+
+  > **Cold-start note:** the `/opt/actions-runner` tmpfs is on a different
+  > device than `/opt/runner-bin`, so the boot-time bootstrap cannot
+  > hard-link and falls back to a full recursive copy of ~200 MB of runner
+  > binaries on every container start. This is unavoidable in read-only
+  > mode. **When you don't need `read_only: true`, omit the
+  > `/opt/actions-runner` tmpfs entirely** — the bootstrap will then
+  > hard-link from the image (typically ~150 ms vs several seconds).
+
+  Set `DISABLE_RUNNER_UPDATE=true` to prevent auto-updates that would be
+  discarded on container restart. `PUID`/`PGID` and Docker Mods are not
+  honored when `read_only: true`. See the README for a full compose example.
+
+# non-root support
+nonroot_supported: true
+nonroot_message: |
+  Two modes are supported:
+    1. Default (recommended): container starts as root, then the runner service
+       is dropped to the LSIO `abc` user (uid 911) via s6-setuidgid. PUID/PGID,
+       Docker Mods, and EXTRA_PACKAGES all work normally.
+    2. LSIO non-root opt-in (https://docs.linuxserver.io/misc/non-root/): set
+       `user: "911:911"` (or any uid:gid) on the service. The container's PID 1
+       runs unprivileged. Caveats: PUID/PGID and EXTRA_PACKAGES are ignored;
+       /run tmpfs MUST be owned by the chosen uid (required for s6); the chosen
+       uid must have docker-socket access for Docker-in-Docker actions. See the
+       README for a full compose example.

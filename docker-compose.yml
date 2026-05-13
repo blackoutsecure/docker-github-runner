@@ -1,0 +1,33 @@
+version: '2.4'
+
+services:
+  gh-runner:
+    image: docker.io/blackoutsecure/docker-github-runner:latest
+    container_name: gh-runner
+    environment:
+      TZ: Etc/UTC
+      RUNNER_EPHEMERAL: "true"
+      DOCKER_IN_DOCKER: "true"
+      AUTO_DOCKER_LABEL: "false"
+      CLEANUP_OFFLINE_RUNNERS: "true"
+    labels:
+      io.balena.features.supervisor-api: '1'
+      io.balena.features.balena-api: '1'
+      io.balena.features.balena-socket: '1'
+    security_opt:
+      - no-new-privileges=true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    tmpfs:
+      - /run:exec,size=64m
+      - /tmp:exec,size=2g
+      - /var/log:size=32m
+    stop_grace_period: 30s
+    shm_size: 1gb
+    restart: unless-stopped

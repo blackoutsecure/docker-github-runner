@@ -1,0 +1,503 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+      - released
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: 'Release name (optional, defaults to upstream runner version)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: read
+
+env:
+  REGISTRY: docker.io
+  DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_NAMESPACE }}
+  IMAGE_NAME: github-runner
+  UPSTREAM_REPO: actions/runner
+  UPSTREAM_TRACK_FILE: .github/upstream/actions-runner.json
+
+jobs:
+  validate-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.detect.outputs.release_tag }}
+      release_name: ${{ steps.detect.outputs.release_name }}
+      event_type: ${{ steps.detect.outputs.event_type }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect release source
+        id: detect
+        env:
+          EVENT_ACTION: ${{ github.event_name }}
+          DISPATCH_NAME: ${{ github.event.inputs.release_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_NAME: ${{ github.event.release.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "ℹ Event: ${EVENT_ACTION}"
+
+          if [ "${EVENT_ACTION}" = "workflow_dispatch" ]; then
+            echo "ℹ Manual dispatch: resolving version from upstream ${UPSTREAM_REPO}"
+
+            UPSTREAM_VERSION=""
+            # Prefer the tracked upstream JSON if present
+            if [ -f "${UPSTREAM_TRACK_FILE}" ]; then
+              UPSTREAM_VERSION="$(jq -r '.version // empty' "${UPSTREAM_TRACK_FILE}")"
+            fi
+
+            # Fall back to the live GitHub releases API
+            if [ -z "${UPSTREAM_VERSION}" ]; then
+              UPSTREAM_VERSION="$(gh api "/repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null | sed 's/^v//')"
+            fi
+
+            if [ -z "${UPSTREAM_VERSION}" ]; then
+              echo "ERROR: Could not resolve upstream ${UPSTREAM_REPO} version"
+              exit 1
+            fi
+
+            echo "ℹ Upstream version detected: ${UPSTREAM_VERSION}"
+            TAG="v${UPSTREAM_VERSION}"
+            NAME="${DISPATCH_NAME:-Upstream actions/runner ${UPSTREAM_VERSION}}"
+          else
+            TAG="${RELEASE_TAG}"
+            NAME="${RELEASE_NAME:-GitHub Release}"
+            echo "ℹ GitHub release detected"
+          fi
+
+          # Validate tag format (vX.Y.Z or X.Y.Z)
+          if ! [[ "${TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Invalid version tag format: ${TAG}"
+            echo "Expected format: v1.2.3 or 1.2.3"
+            exit 1
+          fi
+
+          {
+            echo "release_tag=${TAG}"
+            echo "release_name=${NAME}"
+            echo "event_type=${EVENT_ACTION}"
+          } >> "$GITHUB_OUTPUT"
+          echo "✓ Release validation passed: ${TAG}"
+
+  release-metadata:
+    needs: validate-release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      release_name: ${{ steps.metadata.outputs.release_name }}
+      upstream_commit: ${{ steps.metadata.outputs.upstream_commit }}
+      upstream_version: ${{ steps.metadata.outputs.upstream_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract release metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
+          RELEASE_NAME: ${{ needs.validate-release.outputs.release_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Strip leading "v" from semver tag (e.g. v2.334.0 -> 2.334.0)
+          VERSION="${RELEASE_TAG#v}"
+
+          {
+            echo "version=${VERSION}"
+            echo "release_name=${RELEASE_NAME}"
+          } >> "$GITHUB_OUTPUT"
+          echo "ℹ Release Version: ${VERSION}"
+
+          # Read upstream metadata from tracked file if present
+          UPSTREAM_VERSION=""
+          UPSTREAM_COMMIT=""
+          if [ -f "${UPSTREAM_TRACK_FILE}" ]; then
+            UPSTREAM_VERSION="$(jq -r '.version // empty' "${UPSTREAM_TRACK_FILE}")"
+            UPSTREAM_COMMIT="$(jq -r '.commit // empty' "${UPSTREAM_TRACK_FILE}")"
+          fi
+
+          # Fall back to the live GitHub releases API
+          if [ -z "${UPSTREAM_VERSION}" ] || [ -z "${UPSTREAM_COMMIT}" ]; then
+            if META="$(gh api "/repos/${UPSTREAM_REPO}/releases/latest" 2>/dev/null)"; then
+              [ -z "${UPSTREAM_VERSION}" ] && UPSTREAM_VERSION="$(jq -r '.tag_name // empty' <<<"${META}" | sed 's/^v//')"
+              [ -z "${UPSTREAM_COMMIT}" ] && UPSTREAM_COMMIT="$(jq -r '.target_commitish // empty' <<<"${META}")"
+            fi
+          fi
+
+          UPSTREAM_VERSION="${UPSTREAM_VERSION:-unknown}"
+          UPSTREAM_COMMIT="${UPSTREAM_COMMIT:-unknown}"
+          UPSTREAM_COMMIT_SHORT="${UPSTREAM_COMMIT:0:7}"
+
+          {
+            echo "upstream_commit=${UPSTREAM_COMMIT_SHORT}"
+            echo "upstream_version=${UPSTREAM_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+          echo "ℹ Upstream actions/runner: ${UPSTREAM_VERSION} (${UPSTREAM_COMMIT_SHORT})"
+
+  build-images:
+    needs: [validate-release, release-metadata]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: [self-hosted, Linux, ARM64, ubuntu-latest]
+            platform: linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Validate Docker credentials
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKERHUB_USERNAME}" ] || [ -z "${DOCKERHUB_TOKEN}" ]; then
+            echo "ERROR: Docker Hub credentials not configured"
+            exit 1
+          fi
+          echo "ℹ Docker Hub credentials validated"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Confirm Docker auth
+        run: docker info > /dev/null && echo "✓ Docker authentication confirmed"
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          no-cache: false
+          pull: true
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            APP_VERSION=${{ needs.release-metadata.outputs.version }}
+            VCS_URL=${{ github.server_url }}/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            org.opencontainers.image.version=${{ needs.release-metadata.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  tag-images:
+    needs: [release-metadata, build-images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Download digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: release-digests-*
+          merge-multiple: true
+
+      - name: Extract Docker metadata
+        id: docker-meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release-metadata.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-metadata.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.release-metadata.outputs.version }}
+            type=raw,value=latest
+            type=sha,prefix={{branch}}-
+
+      - name: Create and push multi-arch manifests
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t DIGESTS < <(find /tmp/digests -type f -printf '%f\n' | sort)
+
+          if [ "${#DIGESTS[@]}" -eq 0 ]; then
+            echo "No digests found to assemble multi-arch manifest"
+            exit 1
+          fi
+
+          SOURCES=()
+          for digest in "${DIGESTS[@]}"; do
+            SOURCES+=("${IMAGE_REF}@sha256:${digest}")
+          done
+
+          TAG_ARGS=()
+          while IFS= read -r tag; do
+            [ -z "${tag}" ] && continue
+            TAG_ARGS+=("--tag" "${tag}")
+          done <<< "${{ steps.docker-meta.outputs.tags }}"
+
+          for attempt in 1 2 3; do
+            if docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"; then
+              echo "Multi-arch manifest created successfully"
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "ERROR: Failed to create manifest after 3 attempts"
+              exit 1
+            fi
+            echo "Attempt ${attempt}/3 failed, retrying in 15s..."
+            sleep 15
+          done
+
+  create-github-release:
+    needs: [validate-release, release-metadata, tag-images]
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate release body
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
+          UPSTREAM_COMMIT: ${{ needs.release-metadata.outputs.upstream_commit }}
+          UPSTREAM_VERSION: ${{ needs.release-metadata.outputs.upstream_version }}
+          DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+        run: |
+          BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          cat > /tmp/release_notes.md << EOMD
+          ## Release ${RELEASE_VERSION}
+
+          ### Docker Hub Images
+
+          **Primary Registry:**
+          \`\`\`bash
+          docker pull ${DOCKER_IMAGE}:${RELEASE_VERSION}
+          docker pull ${DOCKER_IMAGE}:latest
+          \`\`\`
+
+          **Available Tags:**
+          - \`${DOCKER_IMAGE}:${RELEASE_VERSION}\` - Specific version (recommended for production)
+          - \`${DOCKER_IMAGE}:latest\` - Latest stable release
+          - Multi-arch support: amd64, arm64
+
+          ### Build Information
+
+          - **Image Version:** ${RELEASE_VERSION}
+          - **Release Tag:** ${RELEASE_TAG}
+          - **Upstream actions/runner:** ${UPSTREAM_VERSION} (commit: ${UPSTREAM_COMMIT})
+          - **Build Date:** ${BUILD_DATE}
+          - **Repository:** ${{ github.server_url }}/${{ github.repository }}
+
+          ### Supported Architectures
+
+          | Architecture | Platform |
+          | --- | --- |
+          | x86-64 | linux/amd64 |
+          | ARM 64-bit | linux/arm64 |
+
+          ### Quick Start
+
+          \`\`\`bash
+          docker run -d \\
+            --name gh-runner \\
+            -e TZ=Etc/UTC \\
+            -e RUNNER_URL=https://github.com/OWNER/REPO \\
+            -e RUNNER_TOKEN=YOUR_REGISTRATION_TOKEN \\
+            -e RUNNER_NAME=my-runner \\
+            -v /srv/gh-runner/config:/config \\
+            -v /var/run/docker.sock:/var/run/docker.sock \\
+            --security-opt no-new-privileges=true \\
+            ${DOCKER_IMAGE}:${RELEASE_VERSION}
+          \`\`\`
+
+          ### Documentation
+
+          - [Full README](${{ github.server_url }}/${{ github.repository }}/blob/main/README.md)
+          - [Upstream actions/runner](https://github.com/actions/runner)
+          - [Release History](${{ github.server_url }}/${{ github.repository }}/releases)
+
+          ### About This Image
+
+          - **Built with:** LinuxServer.io-style patterns (s6-overlay, hardened defaults)
+          - **Maintained by:** Blackout Secure
+          - **Features:** ephemeral runners, Docker-in-Docker support, GitHub PAT-based token generation, health monitoring
+          - **Official Status:** Unofficial community container (not affiliated with GitHub or LinuxServer.io)
+          EOMD
+          cat /tmp/release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate-release.outputs.release_tag }}
+          name: ${{ needs.release-metadata.outputs.release_name }}
+          body_path: /tmp/release_notes.md
+          draft: false
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  create-release-notes:
+    needs: [validate-release, release-metadata]
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'release' && github.event.action == 'published' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate release notes
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
+          UPSTREAM_COMMIT: ${{ needs.release-metadata.outputs.upstream_commit }}
+          UPSTREAM_VERSION: ${{ needs.release-metadata.outputs.upstream_version }}
+          DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+        run: |
+          BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          cat > /tmp/release_notes.md << EOMD
+          ## Release ${RELEASE_VERSION}
+
+          ### Docker Hub Images
+
+          **Primary Registry:**
+          \`\`\`bash
+          docker pull ${DOCKER_IMAGE}:${RELEASE_VERSION}
+          docker pull ${DOCKER_IMAGE}:latest
+          \`\`\`
+
+          **Available Tags:**
+          - \`${DOCKER_IMAGE}:${RELEASE_VERSION}\` - Specific version (recommended for production)
+          - \`${DOCKER_IMAGE}:latest\` - Latest stable release
+          - Multi-arch support: amd64, arm64
+
+          ### Build Information
+
+          - **Image Version:** ${RELEASE_VERSION}
+          - **Release Tag:** ${RELEASE_TAG}
+          - **Upstream actions/runner:** ${UPSTREAM_VERSION} (commit: ${UPSTREAM_COMMIT})
+          - **Build Date:** ${BUILD_DATE}
+          - **Repository:** ${{ github.server_url }}/${{ github.repository }}
+
+          ### Supported Architectures
+
+          | Architecture | Platform |
+          | --- | --- |
+          | x86-64 | linux/amd64 |
+          | ARM 64-bit | linux/arm64 |
+
+          ### Quick Start
+
+          \`\`\`bash
+          docker run -d \\
+            --name gh-runner \\
+            -e TZ=Etc/UTC \\
+            -e RUNNER_URL=https://github.com/OWNER/REPO \\
+            -e RUNNER_TOKEN=YOUR_REGISTRATION_TOKEN \\
+            -e RUNNER_NAME=my-runner \\
+            -v /srv/gh-runner/config:/config \\
+            -v /var/run/docker.sock:/var/run/docker.sock \\
+            --security-opt no-new-privileges=true \\
+            ${DOCKER_IMAGE}:${RELEASE_VERSION}
+          \`\`\`
+
+          ### Documentation
+
+          - [Full README](${{ github.server_url }}/${{ github.repository }}/blob/main/README.md)
+          - [Upstream actions/runner](https://github.com/actions/runner)
+          - [Release History](${{ github.server_url }}/${{ github.repository }}/releases)
+
+          ### About This Image
+
+          - **Built with:** LinuxServer.io-style patterns (s6-overlay, hardened defaults)
+          - **Maintained by:** Blackout Secure
+          - **Features:** ephemeral runners, Docker-in-Docker support, GitHub PAT-based token generation, health monitoring
+          - **Official Status:** Unofficial community container (not affiliated with GitHub or LinuxServer.io)
+          EOMD
+          cat /tmp/release_notes.md
+
+      - name: Update Release Notes
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: /tmp/release_notes.md
+          append_body: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  summary:
+    needs: [validate-release, release-metadata, tag-images, create-github-release, create-release-notes]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Release Summary
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          RELEASE_TAG: ${{ needs.validate-release.outputs.release_tag }}
+          EVENT_NAME: ${{ needs.validate-release.outputs.event_type }}
+          DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          UPSTREAM_VERSION: ${{ needs.release-metadata.outputs.upstream_version }}
+        run: |
+          {
+            echo "## Release Workflow Complete"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Release Event | \`${EVENT_NAME}\` |"
+            echo "| Version | \`${RELEASE_VERSION}\` |"
+            echo "| Release Tag | \`${RELEASE_TAG}\` |"
+            echo "| Docker Hub Image | \`${DOCKER_IMAGE}:${RELEASE_VERSION}\` |"
+            echo "| Latest Tag | \`${DOCKER_IMAGE}:latest\` |"
+            echo "| Upstream actions/runner | \`${UPSTREAM_VERSION}\` |"
+            echo "| Repository | ${{ github.repository }} |"
+            echo "| Triggered by | ${{ github.triggering_actor }} |"
+            echo ""
+            echo "### Next Steps"
+            echo "1. Review release on GitHub: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${RELEASE_TAG}"
+            echo "2. Test image pull: \`docker pull ${DOCKER_IMAGE}:${RELEASE_VERSION}\`"
+            echo "3. Monitor pull statistics and user issues"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,18 @@
+# Normalize line endings to LF
+* text=auto eol=lf
+
+# Explicit text files
+*.sh text eol=lf
+build/*.sh text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+Dockerfile text eol=lf
+LICENSE text eol=lf
+root/etc/s6-overlay/s6-rc.d/*/run text eol=lf
+root/etc/s6-overlay/s6-rc.d/*/type text eol=lf
+root/etc/s6-overlay/s6-rc.d/*/up text eol=lf
+
+# Binary files
+*.png binary
+*.gz binary

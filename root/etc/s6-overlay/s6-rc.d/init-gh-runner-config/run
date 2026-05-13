@@ -1,0 +1,2066 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+set -euo pipefail
+
+# Numeric severity for level-filtering; lines below LOG_LEVEL are dropped.
+# Levels (case-insensitive): debug < info < warn < error < fatal
+# 'fatal' is always shown (it precedes exit). Default LOG_LEVEL=info.
+_log_severity() {
+    case "${1,,}" in
+        debug) echo 10 ;;
+        info)  echo 20 ;;
+        warn)  echo 30 ;;
+        error) echo 40 ;;
+        fatal) echo 50 ;;
+        *)     echo 20 ;;
+    esac
+}
+
+log() {
+    local level="$1"; shift
+    local cur min
+    cur=$(_log_severity "${level}")
+    min=$(_log_severity "${LOG_LEVEL:-info}")
+    # Always print fatal regardless of threshold
+    if [[ "${level,,}" != "fatal" && "${cur}" -lt "${min}" ]]; then
+        return 0
+    fi
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') init-gh-runner-config[${level}]: $*"
+}
+
+log "info" "Initializing GitHub Actions self-hosted runner"
+
+# ---------------------------------------------------------------------------
+# Helper: prefix arbitrary stdout/stderr (e.g. from config.sh, the
+# banner block, etc.) with a uniform `<ts> init-gh-runner-config[<tag>]:`
+# header so external tools/log shippers can identify which service the
+# line came from. Blank lines are dropped to keep the console tidy.
+# Usage:
+#     some_command 2>&1 | prefix_lines config
+#     { echo a; echo b; } | prefix_lines banner
+# ---------------------------------------------------------------------------
+prefix_lines() {
+    local tag="${1:-info}"
+    # Strip non-ASCII bytes from upstream output (e.g. config.sh's UTF-8
+    # checkmarks and box-drawing chars) so balena/non-UTF-8 log viewers
+    # don't render them as garbled `â`-prefixed mojibake. We use sed with
+    # LC_ALL=C so multi-byte sequences are matched as raw bytes; the >0x7E
+    # range covers all non-ASCII. A leading sed pass also rewrites the
+    # most common visual glyphs to readable ASCII equivalents before the
+    # generic strip removes anything left over.
+    #
+    # CRITICAL: wrap both stages in `stdbuf -oL` so the pipeline is
+    # line-buffered end-to-end. Without it, awk's libc stdio buffers
+    # ~4 KB before flushing, and if the init script is killed mid-flight
+    # (e.g. by the orchestrator's healthcheck timing out before init
+    # completes) those buffered log lines never reach the console -- the
+    # operator sees a clean cut at the last full buffer and has no idea
+    # how far init actually got.
+    LC_ALL=C stdbuf -oL sed -u \
+        -e 's/\xe2\x9c\x93/[OK]/g' \
+        -e 's/\xe2\x9c\x94/[OK]/g' \
+        -e 's/\xe2\x9c\x97/[X]/g'  \
+        -e 's/\xe2\x9c\x98/[X]/g'  \
+        -e 's/\xe2\x86\x92/->/g'   \
+        -e 's/[^[:print:]\t]//g' \
+    | stdbuf -oL awk -v tag="${tag}" '
+        # The GitHub Actions config.sh prints a boxed ASCII-art banner
+        # framed by lines of dashes (e.g. "------...------") with "|...|"
+        # rows in between. The image-startup banner is framed by lines
+        # of equals signs ("======...======") with inner dash separators.
+        # Prefixing each line with a "<ts> init-gh-runner-config[<tag>]:"
+        # header destroys the alignment, so detect the banner block and
+        # emit those lines verbatim. Everything outside the block is
+        # prefixed as usual.
+        {
+            if ($0 ~ /^[[:space:]]*$/) next
+
+            # Strip leading/trailing whitespace for matching only.
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+
+            is_eq_fence   = (line ~ /^={20,}$/)
+            is_dash_fence = (line ~ /^-{20,}$/)
+
+            if (is_eq_fence) {
+                # Top/bottom fence of the equals-framed banner.
+                in_eq_banner = !in_eq_banner
+                print line
+                fflush()
+                next
+            }
+
+            if (is_dash_fence) {
+                if (in_eq_banner) {
+                    # Inner separator inside an equals-framed banner --
+                    # do not toggle dash banner mode, just pass through.
+                    print line
+                    fflush()
+                    next
+                }
+                # Standalone dash-framed banner (e.g. config.sh box).
+                in_dash_banner = !in_dash_banner
+                print line
+                fflush()
+                next
+            }
+
+            if (in_eq_banner || in_dash_banner) {
+                # Inside a banner block: emit verbatim to preserve alignment.
+                print $0
+                fflush()
+                next
+            }
+
+            cmd = "date -u +%Y-%m-%dT%H:%M:%SZ"
+            cmd | getline ts
+            close(cmd)
+            printf "%s init-gh-runner-config[%s]: %s\n", ts, tag, $0
+            fflush()
+        }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Detect whether the container is running with the LSIO default model
+# (root → drop to abc) or with `--user <uid>:<gid>` (the LSIO non-root
+# opt-in described at https://docs.linuxserver.io/misc/non-root/).
+#
+# RUN_AS_NONROOT=1 means: we are NOT root; PUID/PGID are ignored, package
+# installs and chowns won't work, and we should run the runner as the
+# current uid (no s6-setuidgid drop).
+# ---------------------------------------------------------------------------
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    RUN_AS_NONROOT=1
+    CURRENT_UID="$(id -u)"
+    CURRENT_GID="$(id -g)"
+    log "info" "Container is running as non-root (uid=${CURRENT_UID} gid=${CURRENT_GID}) -- LSIO non-root mode"
+    log "info" "PUID/PGID, Docker Mods, and EXTRA_PACKAGES are ignored in this mode"
+else
+    RUN_AS_NONROOT=0
+fi
+export RUN_AS_NONROOT
+mkdir -p /run/s6/container_environment 2>/dev/null || true
+printf '%s' "${RUN_AS_NONROOT}" > /run/s6/container_environment/RUN_AS_NONROOT 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Helper: run a command as the runner user.
+#   - Default mode (root → drop): prefix with `s6-setuidgid abc`
+#   - LSIO non-root mode (--user): just run it (we already are non-root)
+# Use as: as_runner_user <cmd> <args...>
+# ---------------------------------------------------------------------------
+as_runner_user() {
+    if [[ "${RUN_AS_NONROOT}" == "1" ]]; then
+        "$@"
+    else
+        s6-setuidgid abc "$@"
+    fi
+}
+
+# Validate LOG_LEVEL early so an obvious typo doesn't silently default to info.
+case "${LOG_LEVEL:-info}" in
+    debug|info|warn|error|fatal|DEBUG|INFO|WARN|ERROR|FATAL) : ;;
+    *)
+        echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') init-gh-runner-config[warn]: Unknown LOG_LEVEL='${LOG_LEVEL}', falling back to 'info' (valid: debug|info|warn|error|fatal)"
+        export LOG_LEVEL="info"
+        ;;
+esac
+log "info" "Log level: ${LOG_LEVEL:-info}"
+
+# Persist LOG_LEVEL so svc-gh-runner / svc-gh-runner-logs see the validated value
+mkdir -p /run/s6/container_environment
+printf '%s' "${LOG_LEVEL:-info}" > /run/s6/container_environment/LOG_LEVEL
+
+# ---------------------------------------------------------------------------
+# Stage progress / timing helpers.
+#
+# The init phase has several long-running silent steps (recursive chown of
+# the ~9000-file runner tree on overlayfs, GitHub API pagination for stale
+# runner cleanup, etc.). Without explicit stage markers operators see the
+# container "hang" with no output for 30-90 seconds and assume it's wedged.
+# Each stage_begin / stage_end pair emits a clearly tagged log line and an
+# elapsed-ms measurement so progress is always visible in `docker logs`.
+# ---------------------------------------------------------------------------
+_STAGE_NAME=""
+_STAGE_START_NS=0
+stage_begin() {
+    _STAGE_NAME="$1"
+    _STAGE_START_NS="$(date +%s%N)"
+    log "info" "==> [stage] ${_STAGE_NAME} ..."
+    sync 2>/dev/null || true
+}
+stage_end() {
+    local end_ns ms
+    end_ns="$(date +%s%N)"
+    ms=$(( (end_ns - _STAGE_START_NS) / 1000000 ))
+    log "info" "<== [stage] ${_STAGE_NAME} done in ${ms} ms"
+    sync 2>/dev/null || true
+    _STAGE_NAME=""
+}
+
+stage_begin "environment & path setup"
+
+# ---------------------------------------------------------------------------
+# Ensure /tmp is world-writable with the sticky bit (1777).
+#
+# When operators mount /tmp as a tmpfs (common in our hardened compose
+# examples and required under read_only:true) Docker creates the mount
+# with the kernel default of 1755 root:root unless mode=1777 is passed
+# in the mount options. Many CI workloads -- notably docker/setup-buildx
+# action, which writes a transient buildkitd config to /tmp -- run as
+# the unprivileged abc user (uid 911) and fail with `mkdir
+# /tmp/buildkitd-configXXXX: permission denied`. We re-apply 1777 here
+# (we are still root at this point in the init sequence and have
+# DAC_OVERRIDE) so older user configs without `mode=1777` keep working.
+# This is a no-op on the default rootfs case where /tmp is already 1777.
+if [[ -d /tmp ]]; then
+    if ! chmod 1777 /tmp 2>/dev/null; then
+        log "warn" "Could not chmod 1777 /tmp -- buildx and other CI tooling running as the runner user may fail with permission errors; mount /tmp tmpfs with mode=1777"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Runner runtime directory.
+#
+# The runner is installed to /opt/runner-bin at image build time, owned by
+# the abc runner user with read-only files but writable directories so the
+# runner can drop its registration files (.runner, .credentials, .env,
+# .path, _diag/, _work/, ...) into the tree at runtime.
+#
+# Earlier revisions copied or hard-linked this tree into a separate
+# /opt/actions-runner runtime dir at every container start, but on
+# overlayfs `cp -al` of ~9000 files took ~140 s -- the dominant cold-start
+# cost for ephemeral runners. We now run the listener directly from
+# /opt/runner-bin: writes go to the container's upper overlay layer (or a
+# tmpfs if the operator chose to mount one) and are wiped on container
+# recreation, which matches the lifecycle of an ephemeral runner.
+#
+# /proc/self/exe always resolves to the *real* path, so .NET picks
+# /opt/runner-bin as the install root and writes state next to it where
+# abc has owner +wx on every subdirectory.
+# ---------------------------------------------------------------------------
+RUNNER_DIR="/opt/runner-bin"
+
+if [[ -d "${RUNNER_DIR}" ]]; then
+    # Defensive ownership/permission fix-up. The build-time install already
+    # chowns to abc:abc with 0755 dirs, but a restored volume, an older
+    # image revision, or a restrictive mount could have flipped that --
+    # without owner +wx on the dirs the runner can't create _diag/ etc.
+    #
+    # FAST PATH: the build-time install drops a `.ownership-baked` marker
+    # (owned abc:abc, mode 0444) into ${RUNNER_DIR}. If it's still present
+    # we trust it absolutely and skip the recursive chown/chmod walks --
+    # on slow ARM storage those walks over ~9000 files take 60-130 s of
+    # silent cold-start time. The previous stat-based probe was unreliable
+    # on balena/overlayfs (it sometimes reported stale uids for files on
+    # the immutable image layer and forced a needless re-chown).
+    #
+    # Operators who flip ownership manually (or restore a stale volume
+    # over the runner dir) can force the legacy fix-up by passing
+    # FORCE_RUNNER_PERMISSIONS_FIX=true.
+    _force_perm_fix="${FORCE_RUNNER_PERMISSIONS_FIX:-false}"
+    _marker="${RUNNER_DIR}/.ownership-baked"
+    if [[ "${_force_perm_fix,,}" != "true" && -f "${_marker}" ]]; then
+        log "debug" "Runner dir ${RUNNER_DIR} carries build-time ownership marker -- skipping recursive chown/chmod (set FORCE_RUNNER_PERMISSIONS_FIX=true to override)"
+    else
+        if [[ "${_force_perm_fix,,}" == "true" ]]; then
+            log "info" "FORCE_RUNNER_PERMISSIONS_FIX=true -- running defensive chown/chmod over ${RUNNER_DIR}"
+        else
+            log "info" "No ownership marker at ${_marker} -- running defensive chown/chmod over ${RUNNER_DIR} (~9000 files, may take a few seconds on slow storage)"
+        fi
+        _chown_start="$(date +%s%N)"
+        if ! chown -R abc:abc "${RUNNER_DIR}" 2>/dev/null; then
+            log "warn" "chown -R abc:abc ${RUNNER_DIR} failed (cap CHOWN missing or read-only mount?) -- runner may hit permission errors"
+        else
+            log "info" "Ownership fix completed in $(( ($(date +%s%N) - _chown_start) / 1000000 )) ms"
+        fi
+        _chmod_start="$(date +%s%N)"
+        find "${RUNNER_DIR}" -type d -exec chmod u+wx {} + 2>/dev/null || true
+        log "info" "Directory mode fix completed in $(( ($(date +%s%N) - _chmod_start) / 1000000 )) ms"
+    fi
+fi
+
+# Migration: if a previous image revision left an /opt/actions-runner tree
+# behind on a persistent volume, drop it so it doesn't waste space (we no
+# longer use it).
+if [[ -d /opt/actions-runner && ! -L /opt/actions-runner ]]; then
+    log "info" "Removing legacy /opt/actions-runner tree (no longer used; runner now runs from ${RUNNER_DIR})"
+    rm -rf /opt/actions-runner 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# Cleanup stale artifacts from previous runs
+# ---------------------------------------------------------------------------
+cleanup_stale_artifacts() {
+    local runner_dir="${RUNNER_DIR:-/opt/runner-bin}"
+
+    # Remove old diagnostic logs (older than 7 days)
+    if [[ -d "${runner_dir}/_diag" ]]; then
+        local count
+        count="$(find "${runner_dir}/_diag" -name '*.log' -mtime +7 -type f 2>/dev/null | wc -l)"
+        if [[ "${count}" -gt 0 ]]; then
+            find "${runner_dir}/_diag" -name '*.log' -mtime +7 -type f -delete
+            log "info" "Cleaned up ${count} stale diagnostic log(s) older than 7 days"
+        fi
+    fi
+
+    # Clean orphaned worker processes left from a hard kill
+    local stale_pids
+    stale_pids="$(pgrep -f 'Runner.Worker' 2>/dev/null || true)"
+    if [[ -n "${stale_pids}" ]]; then
+        log "warn" "Found orphaned Runner.Worker processes, terminating: ${stale_pids}"
+        echo "${stale_pids}" | xargs kill -9 2>/dev/null || true
+    fi
+
+    # Remove stale runner credential/session files if the runner was not
+    # cleanly deregistered (ephemeral restart scenario)
+    if [[ "${RUNNER_EPHEMERAL:-false}" == "true" && -f "${runner_dir}/.runner" ]]; then
+        log "info" "Ephemeral mode: removing stale .runner config from previous run"
+        rm -f "${runner_dir}/.runner" \
+              "${runner_dir}/.credentials" \
+              "${runner_dir}/.credentials_rsaparams"
+    fi
+}
+
+cleanup_stale_artifacts
+stage_end
+
+stage_begin "secret resolution (RUNNER_TOKEN / GITHUB_PAT / GITHUB_TOKEN / RUNNER_URL)"
+
+resolve_secret() {
+    local var_name="$1"
+    local file_var="${var_name}_FILE"
+    local file_path="${!file_var:-}"
+    local current_val="${!var_name:-}"
+
+    if [[ -n "${file_path}" ]]; then
+        if [[ -f "${file_path}" && -r "${file_path}" ]]; then
+            local secret
+            secret="$(< "${file_path}")"
+            # Trim trailing newlines
+            secret="${secret%%$'\n'}"
+            export "${var_name}=${secret}"
+            log "info" "${var_name} loaded from file (${file_var})"
+        else
+            log "fatal" "${file_var} is set to '${file_path}' but the file does not exist or is not readable"
+            exit 1
+        fi
+    fi
+}
+
+resolve_secret RUNNER_TOKEN
+resolve_secret RUNNER_URL
+resolve_secret GITHUB_PAT
+resolve_secret GITHUB_TOKEN
+stage_end
+
+generate_registration_token() {
+    local auth_token="$1"
+    local token_source="$2"
+
+    if [[ -z "${RUNNER_URL:-}" ]]; then
+        log "fatal" "RUNNER_URL is required when using ${token_source} to generate a registration token"
+        exit 1
+    fi
+
+    local url_path="${RUNNER_URL#https://github.com/}"
+    url_path="${url_path%/}"  # strip trailing slash
+
+    local api_base="https://api.github.com"
+    local token_url scope_desc
+
+    if [[ "${url_path}" == enterprises/* ]]; then
+        local ent_name="${url_path#enterprises/}"
+        token_url="${api_base}/enterprises/${ent_name}/actions/runners/registration-token"
+        scope_desc="enterprise/${ent_name}"
+    elif [[ "${url_path}" == */* ]]; then
+        token_url="${api_base}/repos/${url_path}/actions/runners/registration-token"
+        scope_desc="repo/${url_path}"
+    else
+        token_url="${api_base}/orgs/${url_path}/actions/runners/registration-token"
+        scope_desc="org/${url_path}"
+    fi
+
+    log "info" "Generating registration token via GitHub API (${scope_desc}) using ${token_source}"
+
+    local http_response
+    http_response="$(curl -fsSL -w "\n%{http_code}" -X POST \
+        -H "Authorization: token ${auth_token}" \
+        -H "Accept: application/vnd.github+json" \
+        "${token_url}" 2>&1)" || {
+        log "fatal" "Failed to request registration token from GitHub API"
+        log "fatal" "URL: ${token_url}"
+        log "fatal" "Source: ${token_source}"
+        log "fatal" "Response: ${http_response}"
+        log "fatal" "Ensure the token has the required permissions:"
+        log "fatal" "  - Classic PAT: 'repo' scope (repo-level) or 'admin:org' scope (org-level)"
+        log "fatal" "  - Fine-grained PAT: 'Administration' permission (read & write)"
+        log "fatal" "  - GITHUB_TOKEN (Actions): must have 'actions' write permission"
+        exit 1
+    }
+
+    local http_body http_code
+    http_body="$(echo "${http_response}" | head -n -1)"
+    http_code="$(echo "${http_response}" | tail -n 1)"
+
+    if [[ "${http_code}" != "201" ]]; then
+        log "fatal" "GitHub API returned HTTP ${http_code} when generating registration token"
+        log "fatal" "Source: ${token_source}"
+        log "fatal" "Response: ${http_body}"
+        exit 1
+    fi
+
+    RUNNER_TOKEN="$(echo "${http_body}" | jq -r '.token // empty')"
+    if [[ -z "${RUNNER_TOKEN}" ]]; then
+        log "fatal" "GitHub API response did not contain a token"
+        log "fatal" "Response: ${http_body}"
+        exit 1
+    fi
+
+    export RUNNER_TOKEN
+    local expires_at expires_utc
+    expires_at="$(echo "${http_body}" | jq -r '.expires_at // "unknown"')"
+    # Normalize to UTC. The GitHub API returns the timestamp in the
+    # account's local TZ (e.g. "2026-04-20T08:46:30.714-04:00"); converting
+    # to UTC keeps every log line in the same time zone.
+    if [[ "${expires_at}" != "unknown" ]]; then
+        expires_utc="$(date -u -d "${expires_at}" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${expires_at}")"
+    else
+        expires_utc="unknown"
+    fi
+    log "info" "Registration token generated successfully (expires: ${expires_utc})"
+}
+
+if [[ -z "${RUNNER_TOKEN:-}" ]]; then
+    stage_begin "minting registration token via GitHub API"
+    if [[ -n "${GITHUB_PAT:-}" ]]; then
+        generate_registration_token "${GITHUB_PAT}" "GITHUB_PAT"
+    elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        generate_registration_token "${GITHUB_TOKEN}" "GITHUB_TOKEN"
+    fi
+    stage_end
+fi
+
+
+if [[ -z "${RUNNER_URL:-}" ]]; then
+    log "fatal" "RUNNER_URL or RUNNER_URL_FILE is required (e.g. https://github.com/owner/repo)"
+    exit 1
+fi
+
+if [[ -z "${RUNNER_TOKEN:-}" ]]; then
+    log "fatal" "One of the following is required to authenticate:"
+    log "fatal" "  RUNNER_TOKEN / RUNNER_TOKEN_FILE  -- pre-generated registration token (expires in 1h)"
+    log "fatal" "  GITHUB_PAT   / GITHUB_PAT_FILE   -- long-lived PAT to auto-generate tokens via API"
+    log "fatal" "  GITHUB_TOKEN / GITHUB_TOKEN_FILE  -- repo secret or Actions token (e.g. \${{ secrets.MY_TOKEN }})"
+    exit 1
+fi
+
+
+if [[ -z "${RUNNER_NAME:-}" ]]; then
+    # Auto-derive a stable, human-readable runner name when none is
+    # supplied. Priority order:
+    #   1. BALENA_DEVICE_NAME_AT_INIT     (balenaCloud, set when
+    #      io.balena.features.balena-api label is present)
+    #   2. RESIN_DEVICE_NAME_AT_INIT      (legacy resin.io variant)
+    #   3. ${HOSTNAME}-${BALENA_SERVICE_HANDLE}  (multi-service balena
+    #      apps where every container shares the device hostname)
+    #   4. container hostname (docker default; a random hex string)
+    # The container's docker hostname is a random hex string that's not
+    # grep-able in GitHub's runner UI and breaks CLEANUP_OFFLINE_NAME_REGEX.
+    if [[ -n "${BALENA_DEVICE_NAME_AT_INIT:-}" ]]; then
+        RUNNER_NAME="${BALENA_DEVICE_NAME_AT_INIT}${BALENA_SERVICE_HANDLE:+-${BALENA_SERVICE_HANDLE}}"
+        RUNNER_NAME_SOURCE="auto: BALENA_DEVICE_NAME_AT_INIT"
+    elif [[ -n "${RESIN_DEVICE_NAME_AT_INIT:-}" ]]; then
+        RUNNER_NAME="${RESIN_DEVICE_NAME_AT_INIT}${BALENA_SERVICE_HANDLE:+-${BALENA_SERVICE_HANDLE}}"
+        RUNNER_NAME_SOURCE="auto: RESIN_DEVICE_NAME_AT_INIT"
+    elif [[ -n "${BALENA_SERVICE_HANDLE:-}" ]]; then
+        RUNNER_NAME="$(hostname)-${BALENA_SERVICE_HANDLE}"
+        RUNNER_NAME_SOURCE="auto: hostname-BALENA_SERVICE_HANDLE"
+    else
+        RUNNER_NAME="$(hostname)"
+        RUNNER_NAME_SOURCE="auto: container hostname"
+    fi
+    # Sanitize: GitHub runner names must be <=64 chars and only allow
+    # ASCII letters/digits/dash/underscore/dot. Replace anything else
+    # with '-' and truncate.
+    RUNNER_NAME="$(printf '%s' "${RUNNER_NAME}" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-64)"
+    log "info" "RUNNER_NAME not set, derived: ${RUNNER_NAME} (${RUNNER_NAME_SOURCE})"
+else
+    RUNNER_NAME_SOURCE="explicit: RUNNER_NAME env"
+    log "info" "RUNNER_NAME provided explicitly via env: ${RUNNER_NAME}"
+fi
+export RUNNER_NAME_SOURCE
+
+if [[ -z "${RUNNER_LABELS:-}" ]]; then
+    RUNNER_LABELS="self-hosted"
+    log "info" "RUNNER_LABELS not set, defaulting to: ${RUNNER_LABELS}"
+fi
+
+# Note: Runner.Listener automatically injects system labels (`self-hosted`,
+# OS — `Linux`/`Windows`/`macOS`, and arch — `X64`/`ARM`/`ARM64`) on top of
+# whatever custom labels we pass via `--labels`. We deliberately do NOT add
+# our own `linux`/`arm64`/etc. labels here to avoid duplicates in the GitHub
+# UI. See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-labels-with-self-hosted-runners#about-self-hosted-runner-labels
+
+# Auto-append `docker` label when DOCKER_IN_DOCKER is enabled so workflows
+# can target this runner with `runs-on: [self-hosted, docker]`. Controlled
+# by AUTO_DOCKER_LABEL (defaults to the value of DOCKER_IN_DOCKER); set
+# AUTO_DOCKER_LABEL=false to keep DinD enabled without advertising the
+# `docker` label.
+AUTO_DOCKER_LABEL="${AUTO_DOCKER_LABEL:-${DOCKER_IN_DOCKER:-false}}"
+if [[ "${AUTO_DOCKER_LABEL}" == "true" ]]; then
+    LABELS_LOWER="${RUNNER_LABELS,,}"
+    if [[ "${LABELS_LOWER}" != *"docker"* ]]; then
+        RUNNER_LABELS="${RUNNER_LABELS},docker"
+        if [[ "${DOCKER_IN_DOCKER:-false}" == "true" ]]; then
+            log "info" "Auto-appended label: docker (DOCKER_IN_DOCKER=true; disable with AUTO_DOCKER_LABEL=false)"
+        else
+            log "info" "Auto-appended label: docker (AUTO_DOCKER_LABEL=true)"
+        fi
+    fi
+fi
+
+# Sanitize labels: trim leading/trailing whitespace from each label and
+# remove any empty entries (e.g. from trailing commas or double commas).
+RUNNER_LABELS="$(echo "${RUNNER_LABELS}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | paste -sd ',' -)"
+
+export RUNNER_LABELS
+
+
+RUNNER_WORKDIR="${RUNNER_WORKDIR:-/config/work}"
+mkdir -p "${RUNNER_WORKDIR}"
+chown abc:abc "${RUNNER_WORKDIR}"
+
+# ---------------------------------------------------------------------------
+# Docker-in-Docker setup (when DOCKER_IN_DOCKER=true)
+# Ensures the runner user (abc) is in a group that owns the mounted Docker
+# socket, so container-based GitHub Actions can talk to the host Docker
+# daemon. Requires a host engine socket to be bind-mounted into the
+# container. Supports the standard /var/run/docker.sock as well as
+# Balena (/var/run/balena-engine.sock, /var/run/balena.sock) and a few
+# other common paths. The path can also be forced via DOCKER_HOST_SOCK.
+# ---------------------------------------------------------------------------
+DOCKER_SOCK_PATH=""
+
+resolve_docker_sock() {
+    local candidates=()
+    if [[ -n "${DOCKER_HOST_SOCK:-}" ]]; then
+        candidates+=("${DOCKER_HOST_SOCK}")
+    fi
+    candidates+=(
+        "/var/run/docker.sock"
+        "/var/run/balena-engine.sock"
+        "/var/run/balena.sock"
+        "/run/docker.sock"
+    )
+    local p
+    for p in "${candidates[@]}"; do
+        if [[ -S "${p}" ]]; then
+            DOCKER_SOCK_PATH="${p}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+setup_docker_in_docker() {
+    [[ "${DOCKER_IN_DOCKER:-false}" == "true" ]] || return 0
+
+    if ! resolve_docker_sock; then
+        log "warn" "DOCKER_IN_DOCKER=true but no engine socket is mounted"
+        log "warn" "  Checked: \${DOCKER_HOST_SOCK}, /var/run/docker.sock, /var/run/balena-engine.sock, /var/run/balena.sock, /run/docker.sock"
+        log "warn" "  Plain Docker:  volumes:\n    - /var/run/docker.sock:/var/run/docker.sock"
+        log "warn" "  Balena:        labels: { io.balena.features.balena-socket: '1' }"
+        return 0
+    fi
+    log "info" "DOCKER_IN_DOCKER: using engine socket ${DOCKER_SOCK_PATH}"
+
+    # If the discovered socket is not the conventional path, expose a symlink
+    # at /var/run/docker.sock so the docker CLI in jobs works without
+    # DOCKER_HOST being set explicitly.
+    if [[ "${DOCKER_SOCK_PATH}" != "/var/run/docker.sock" && ! -e /var/run/docker.sock ]]; then
+        if ln -s "${DOCKER_SOCK_PATH}" /var/run/docker.sock 2>/dev/null; then
+            log "info" "DOCKER_IN_DOCKER: symlinked ${DOCKER_SOCK_PATH} -> /var/run/docker.sock"
+        else
+            log "warn" "DOCKER_IN_DOCKER: could not symlink ${DOCKER_SOCK_PATH} -> /var/run/docker.sock; jobs may need DOCKER_HOST=unix://${DOCKER_SOCK_PATH}"
+        fi
+    fi
+
+    if [[ "${RUN_AS_NONROOT}" == "1" ]]; then
+        log "info" "DOCKER_IN_DOCKER=true: running as non-root (--user) -- group fixup skipped"
+        log "info" "  Ensure the chosen uid is already a member of a group with gid matching the host's docker socket"
+        return 0
+    fi
+
+    local sock_gid sock_group
+    sock_gid="$(stat -c '%g' "${DOCKER_SOCK_PATH}" 2>/dev/null || echo 0)"
+    if [[ "${sock_gid}" == "0" ]]; then
+        log "info" "DOCKER_IN_DOCKER: ${DOCKER_SOCK_PATH} is owned by root -- abc already has access via DAC_OVERRIDE/root drop"
+        return 0
+    fi
+
+    # Find or create a group with that gid, then add abc to it.
+    sock_group="$(getent group "${sock_gid}" | cut -d: -f1 || true)"
+
+    # /etc must be writable for groupadd/usermod. With read_only: true the
+    # rootfs is immutable and we cannot modify /etc/group or /etc/passwd.
+    if ! ( : > /etc/.dind.rwtest ) 2>/dev/null; then
+        log "warn" "DOCKER_IN_DOCKER=true: /etc is read-only -- cannot add abc (uid 911) to group with gid=${sock_gid}"
+        log "warn" "  Options: (1) set read_only: false, (2) on the host run: sudo setfacl -m u:911:rw ${DOCKER_SOCK_PATH}, or (3) use a docker socket proxy"
+        return 0
+    fi
+    rm -f /etc/.dind.rwtest
+
+    if [[ -z "${sock_group}" ]]; then
+        sock_group="docker_host"
+        if groupadd -g "${sock_gid}" "${sock_group}" 2>/dev/null; then
+            log "info" "DOCKER_IN_DOCKER: created group ${sock_group} (gid=${sock_gid}) to match ${DOCKER_SOCK_PATH}"
+        else
+            log "warn" "DOCKER_IN_DOCKER: failed to create group with gid=${sock_gid} -- DinD jobs may fail"
+            return 0
+        fi
+    else
+        log "info" "DOCKER_IN_DOCKER: ${DOCKER_SOCK_PATH} gid=${sock_gid} maps to existing group '${sock_group}'"
+    fi
+
+    if id -nG abc 2>/dev/null | tr ' ' '\n' | grep -qx "${sock_group}"; then
+        log "debug" "DOCKER_IN_DOCKER: abc already a member of ${sock_group}"
+    elif usermod -aG "${sock_group}" abc 2>/dev/null; then
+        log "info" "DOCKER_IN_DOCKER: added abc to ${sock_group} group"
+    else
+        log "warn" "DOCKER_IN_DOCKER: failed to add abc to ${sock_group} -- DinD jobs may fail"
+    fi
+}
+setup_docker_in_docker
+
+cd /opt/runner-bin
+
+# ---------------------------------------------------------------------------
+# Pre-flight permission & environment checks
+# Each check emits a single line with a [ OK ] / [WARN] / [FAIL] tag so they
+# are easy to grep for in container logs. FAIL increments PREFLIGHT_FAILED
+# and aborts startup at the end of the block.
+# ---------------------------------------------------------------------------
+PREFLIGHT_FAILED=0
+PREFLIGHT_WARNED=0
+
+preflight() {
+    local status="$1"   # OK | WARN | FAIL
+    local name="$2"
+    local detail="${3:-}"
+    local tag
+    case "${status}" in
+        OK)   tag="[ OK ]" ;;
+        WARN) tag="[WARN]"; PREFLIGHT_WARNED=$((PREFLIGHT_WARNED + 1)) ;;
+        FAIL) tag="[FAIL]"; PREFLIGHT_FAILED=$((PREFLIGHT_FAILED + 1)) ;;
+        *)    tag="[ ?? ]" ;;
+    esac
+    if [[ -n "${detail}" ]]; then
+        log "info" "preflight ${tag} ${name} -- ${detail}"
+    else
+        log "info" "preflight ${tag} ${name}"
+    fi
+}
+
+stage_begin "pre-flight permission & environment checks"
+log "info" "Running pre-flight permission and environment checks..."
+
+# --- Required tools ---
+for bin in curl jq tar; do
+    if command -v "${bin}" >/dev/null 2>&1; then
+        preflight OK "tool:${bin}"
+    else
+        preflight FAIL "tool:${bin}" "binary not found on PATH"
+    fi
+done
+
+# --- Runner binary ---
+if [[ -x /opt/runner-bin/bin/Runner.Listener ]]; then
+    preflight OK "runner-binary" "/opt/runner-bin/bin/Runner.Listener"
+else
+    preflight FAIL "runner-binary" "Runner.Listener missing or not executable"
+fi
+if [[ -x /opt/runner-bin/config.sh && -x /opt/runner-bin/run.sh ]]; then
+    preflight OK "runner-scripts" "config.sh, run.sh executable"
+else
+    preflight FAIL "runner-scripts" "config.sh / run.sh missing or not executable"
+fi
+
+# --- abc user can read the runner install dir & write the work dir ---
+if as_runner_user test -r /opt/runner-bin/bin/Runner.Listener; then
+    preflight OK "runner-readable-by-abc"
+else
+    preflight FAIL "runner-readable-by-abc" "abc cannot read /opt/runner-bin -- fix ownership"
+fi
+if as_runner_user bash -c "touch /opt/runner-bin/.preflight-write && rm -f /opt/runner-bin/.preflight-write" 2>/dev/null; then
+    preflight OK "runner-writable-by-abc"
+else
+    preflight FAIL "runner-writable-by-abc" "abc cannot write to /opt/runner-bin -- config.sh will fail when it tries to create .env / .runner / _diag (check chown abc:abc /opt/runner-bin and that the path isn't a read-only mount)"
+fi
+if as_runner_user bash -c "touch '${RUNNER_WORKDIR}/.preflight' && rm -f '${RUNNER_WORKDIR}/.preflight'" 2>/dev/null; then
+    preflight OK "workdir-writable" "${RUNNER_WORKDIR} writable by abc (uid 911)"
+else
+    preflight FAIL "workdir-writable" "abc cannot write to ${RUNNER_WORKDIR}"
+fi
+
+# --- /config persistence dir ---
+if as_runner_user bash -c "touch /config/.preflight && rm -f /config/.preflight" 2>/dev/null; then
+    preflight OK "config-dir-writable" "/config writable by abc"
+else
+    preflight WARN "config-dir-writable" "/config not writable by abc -- runner state will not persist"
+fi
+
+# --- Docker socket (controlled by DOCKER_IN_DOCKER) ---
+if [[ "${DOCKER_IN_DOCKER:-false}" == "true" ]]; then
+    # setup_docker_in_docker already ran resolve_docker_sock; if it failed
+    # there, DOCKER_SOCK_PATH will be empty here. Try once more in case the
+    # socket appeared late (e.g. host-side service still starting).
+    if [[ -z "${DOCKER_SOCK_PATH:-}" ]]; then
+        resolve_docker_sock || true
+    fi
+    if [[ -n "${DOCKER_SOCK_PATH:-}" && -S "${DOCKER_SOCK_PATH}" ]]; then
+        if as_runner_user bash -c "curl -fsS --unix-socket '${DOCKER_SOCK_PATH}' http://localhost/_ping >/dev/null 2>&1"; then
+            preflight OK "docker-in-docker" "runner user can access ${DOCKER_SOCK_PATH}"
+        else
+            sock_gid="$(stat -c '%g' "${DOCKER_SOCK_PATH}" 2>/dev/null || echo unknown)"
+            preflight FAIL "docker-in-docker" \
+                "DOCKER_IN_DOCKER=true and ${DOCKER_SOCK_PATH} is mounted, but the runner user cannot reach the Docker API (socket gid=${sock_gid}); container-based jobs will fail"
+        fi
+    else
+        preflight FAIL "docker-in-docker" \
+            "DOCKER_IN_DOCKER=true but no engine socket is mounted (checked DOCKER_HOST_SOCK, /var/run/docker.sock, /var/run/balena-engine.sock, /var/run/balena.sock, /run/docker.sock); bind-mount one from the host or set DOCKER_IN_DOCKER=false"
+    fi
+elif [[ -S /var/run/docker.sock ]]; then
+    preflight OK "docker-in-docker" "DOCKER_IN_DOCKER=false; docker.sock is mounted but unused (set DOCKER_IN_DOCKER=true to enable container-based jobs)"
+else
+    preflight OK "docker-in-docker" "disabled (DOCKER_IN_DOCKER=false, no socket mounted)"
+fi
+
+# --- Token presence (one of) ---
+if [[ -n "${RUNNER_TOKEN:-}" ]]; then
+    preflight OK "auth-token" "registration token present"
+elif [[ -n "${GITHUB_PAT:-}" ]]; then
+    preflight OK "auth-token" "GITHUB_PAT present (registration token will be minted)"
+elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    preflight OK "auth-token" "GITHUB_TOKEN present (registration token will be minted)"
+else
+    preflight FAIL "auth-token" "no RUNNER_TOKEN / GITHUB_PAT / GITHUB_TOKEN provided"
+fi
+
+# --- GitHub API reachability + PAT scope inspection ---
+# Optimized: the bare-reachability probe was redundant (any failure would
+# also fail the /user and runners-scope calls below with curl exit != 0),
+# so we drop it. /user (token + scopes) and the runners-scope probe are
+# independent network calls -- we run them in parallel to collapse two
+# sequential ~RTT waits into one. Each call's max-time is tightened from
+# 10s to 6s; api.github.com is consistently sub-second from any region.
+preflight_check_api() {
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+
+    if [[ -z "${auth_token}" ]]; then
+        # No token: do a single cheap unauth ping just to confirm DNS/egress.
+        local conn_code
+        conn_code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 6 \
+            https://api.github.com 2>/dev/null || echo "000")"
+        if [[ "${conn_code}" =~ ^(200|301|302)$ ]]; then
+            preflight OK "github-api-reachable" "https://api.github.com (HTTP ${conn_code})"
+        else
+            preflight FAIL "github-api-reachable" "could not reach api.github.com (HTTP ${conn_code})"
+            return
+        fi
+        preflight WARN "github-api-auth" \
+            "no PAT/GITHUB_TOKEN -- runner-group sync, label sync, and stale-runner cleanup are disabled"
+        return
+    fi
+
+    # Resolve the scope-specific runners URL up-front so both probes can fire.
+    local url_path="${RUNNER_URL#https://github.com/}"
+    url_path="${url_path%/}"
+    local probe_url scope_label
+    if [[ "${url_path}" == enterprises/* ]]; then
+        probe_url="https://api.github.com/enterprises/${url_path#enterprises/}/actions/runners"
+        scope_label="enterprise/${url_path#enterprises/}"
+    elif [[ "${url_path}" == */* ]]; then
+        probe_url="https://api.github.com/repos/${url_path}/actions/runners"
+        scope_label="repo/${url_path}"
+    else
+        probe_url="https://api.github.com/orgs/${url_path}/actions/runners"
+        scope_label="org/${url_path}"
+    fi
+
+    local user_hdr user_body_file scope_body_file
+    user_hdr="$(mktemp)"
+    user_body_file="$(mktemp)"
+    scope_body_file="$(mktemp)"
+
+    local _t_start _t_end _t_ms
+    _t_start="$(date +%s%N)"
+
+    # Fire both probes in parallel; capture their HTTP codes via -w.
+    # Note: -f is intentionally OMITTED -- with -f, curl exits non-zero on
+    # 4xx and never writes %{http_code}, masking real auth/scope failures
+    # as a generic '000'. Without -f we always get the real status code.
+    ( curl -sS -o "${user_body_file}" -D "${user_hdr}" -w '%{http_code}' --max-time 6 \
+        -H "Authorization: token ${auth_token}" \
+        -H "Accept: application/vnd.github+json" \
+        https://api.github.com/user 2>/dev/null > "${user_body_file}.code" ) &
+    local user_pid=$!
+
+    ( curl -sS -o "${scope_body_file}" -w '%{http_code}' --max-time 6 \
+        -H "Authorization: token ${auth_token}" \
+        -H "Accept: application/vnd.github+json" \
+        "${probe_url}" 2>/dev/null > "${scope_body_file}.code" ) &
+    local scope_pid=$!
+
+    wait "${user_pid}" 2>/dev/null || true
+    wait "${scope_pid}" 2>/dev/null || true
+
+    _t_end="$(date +%s%N)"
+    _t_ms=$(( (_t_end - _t_start) / 1000000 ))
+
+    local body_code probe_code
+    body_code="$(cat "${user_body_file}.code" 2>/dev/null || echo "000")"
+    probe_code="$(cat "${scope_body_file}.code" 2>/dev/null || echo "000")"
+    [[ -z "${body_code}" ]] && body_code="000"
+    [[ -z "${probe_code}" ]] && probe_code="000"
+
+    # Reachability inferred from the parallel calls -- no extra round-trip.
+    if [[ "${body_code}" == "000" && "${probe_code}" == "000" ]]; then
+        preflight FAIL "github-api-reachable" "could not reach api.github.com (both probes timed out / DNS failure)"
+        rm -f "${user_hdr}" "${user_body_file}" "${user_body_file}.code" \
+              "${scope_body_file}" "${scope_body_file}.code"
+        return
+    fi
+    preflight OK "github-api-reachable" "https://api.github.com (parallel probes completed in ${_t_ms} ms)"
+
+    # /user response -> auth + scopes
+    if [[ "${body_code}" != "200" ]]; then
+        preflight FAIL "github-api-auth" \
+            "token rejected by GitHub API (HTTP ${body_code}) -- token may be expired or invalid"
+    else
+        local scopes
+        scopes="$(grep -i '^x-oauth-scopes:' "${user_hdr}" | sed 's/^[^:]*://; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d '\r')"
+        if [[ -z "${scopes}" ]]; then
+            preflight OK "github-api-auth" "token accepted (fine-grained PAT or GITHUB_TOKEN; scopes opaque)"
+        else
+            preflight OK "github-api-auth" "token accepted; scopes: ${scopes}"
+        fi
+    fi
+
+    rm -f "${user_hdr}" "${user_body_file}" "${user_body_file}.code" \
+          "${scope_body_file}" "${scope_body_file}.code"
+
+    case "${probe_code}" in
+        200)
+            preflight OK "github-runners-scope" "${scope_label} runners API readable"
+            ;;
+        401)
+            preflight FAIL "github-runners-scope" \
+                "${scope_label} returned 401 -- token is invalid or expired"
+            ;;
+        403)
+            preflight FAIL "github-runners-scope" \
+                "${scope_label} returned 403 -- token lacks 'admin:org'/'manage_runners' or repo 'administration' permission"
+            ;;
+        404)
+            preflight FAIL "github-runners-scope" \
+                "${scope_label} returned 404 -- wrong RUNNER_URL or token cannot see this scope"
+            ;;
+        *)
+            preflight WARN "github-runners-scope" \
+                "${scope_label} returned HTTP ${probe_code} -- proceeding but registration may fail"
+            ;;
+    esac
+}
+preflight_check_api
+
+# --- Stale-runner cleanup feature pre-flight (only when enabled) ---
+if [[ "${CLEANUP_OFFLINE_RUNNERS:-false}" == "true" ]]; then
+    # Token availability: cleanup uses GITHUB_PAT or GITHUB_TOKEN, the same
+    # token already validated by preflight_check_api against the runners
+    # endpoint. DELETE on /actions/runners/{id} requires the same scope as
+    # registration (admin:org / manage_runners:enterprise / repo
+    # administration), so a passing `github-runners-scope` check implies
+    # the cleanup sweep can also delete -- we don't repeat it here.
+    if [[ -z "${GITHUB_PAT:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
+        preflight FAIL "cleanup-offline-runners" \
+            "CLEANUP_OFFLINE_RUNNERS=true but no GITHUB_PAT / GITHUB_TOKEN -- cleanup cannot call DELETE without an authenticated token"
+    else
+        preflight OK "cleanup-offline-runners" "enabled"
+    fi
+
+    # Threshold sanity: cleanup function refuses anything <300, but we
+    # warn here so a misconfigured value is visible at startup.
+    _cleanup_after="${CLEANUP_OFFLINE_AFTER:-86400}"
+    if ! [[ "${_cleanup_after}" =~ ^[0-9]+$ ]] || (( _cleanup_after < 300 )); then
+        preflight WARN "cleanup-offline-after" \
+            "CLEANUP_OFFLINE_AFTER='${CLEANUP_OFFLINE_AFTER:-}' invalid (must be integer >=300); will use default 86400"
+    else
+        preflight OK "cleanup-offline-after" "${_cleanup_after}s"
+    fi
+
+    # Optional regex must compile -- bad pattern would crash jq mid-sweep.
+    if [[ -n "${CLEANUP_OFFLINE_NAME_REGEX:-}" ]]; then
+        if echo "test-name" | jq -Rr --arg r "${CLEANUP_OFFLINE_NAME_REGEX}" \
+            'test($r) | tostring' >/dev/null 2>&1; then
+            preflight OK "cleanup-name-regex" "pattern compiles ('${CLEANUP_OFFLINE_NAME_REGEX}')"
+        else
+            preflight FAIL "cleanup-name-regex" \
+                "CLEANUP_OFFLINE_NAME_REGEX='${CLEANUP_OFFLINE_NAME_REGEX}' is not a valid jq regex"
+        fi
+    fi
+
+    # State file persistence: we write to /config/.gh-runner-offline-state.json
+    # so that a runner offline streak survives container restarts. If /config
+    # is not writable by abc the cleanup still works but the offline timer
+    # resets every restart, which usually means nothing ever exceeds the
+    # threshold. Warn rather than fail so the feature still functions.
+    if as_runner_user bash -c "touch /config/.cleanup-state.rwtest && rm -f /config/.cleanup-state.rwtest" 2>/dev/null; then
+        preflight OK "cleanup-state-writable" "/config writable for /config/.gh-runner-offline-state.json"
+    else
+        preflight WARN "cleanup-state-writable" \
+            "abc cannot write /config -- offline-since timestamps will reset every restart and runners may never exceed CLEANUP_OFFLINE_AFTER"
+    fi
+
+    # Dry-run advisory -- visible reminder so an operator doesn't think
+    # cleanup is actually pruning when it isn't.
+    if [[ "${CLEANUP_OFFLINE_DRY_RUN:-false}" == "true" ]]; then
+        preflight OK "cleanup-dry-run" "DRY RUN active -- no DELETE calls will be made"
+    fi
+fi
+
+if [[ "${PREFLIGHT_FAILED}" -gt 0 ]]; then
+    log "fatal" "Pre-flight checks failed: ${PREFLIGHT_FAILED} error(s), ${PREFLIGHT_WARNED} warning(s) -- aborting"
+    exit 1
+fi
+if [[ "${PREFLIGHT_WARNED}" -gt 0 ]]; then
+    log "warn" "Pre-flight completed with ${PREFLIGHT_WARNED} warning(s) -- continuing"
+else
+    log "info" "Pre-flight checks passed"
+fi
+stage_end
+
+# ---------------------------------------------------------------------------
+# Helper: resolve the GitHub API runners list URL for the configured scope
+# ---------------------------------------------------------------------------
+resolve_api_runners_url() {
+    local url_path="${RUNNER_URL#https://github.com/}"
+    url_path="${url_path%/}"
+    local api_base="https://api.github.com"
+
+    if [[ "${url_path}" == enterprises/* ]]; then
+        echo "${api_base}/enterprises/${url_path#enterprises/}/actions/runners"
+    elif [[ "${url_path}" == */* ]]; then
+        echo "${api_base}/repos/${url_path}/actions/runners"
+    else
+        echo "${api_base}/orgs/${url_path}/actions/runners"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: fetch all registered runners (name + status) from the GitHub API.
+# Outputs lines of "name<TAB>status" (e.g. "my-runner	online").
+# ---------------------------------------------------------------------------
+api_list_runners() {
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    [[ -n "${auth_token}" ]] || return 1
+
+    local runners_url
+    runners_url="$(resolve_api_runners_url)"
+
+    local page=1
+    while [[ "${page}" -le 10 ]]; do
+        local resp
+        resp="$(curl -fsSL \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${runners_url}?per_page=100&page=${page}" 2>/dev/null)" || break
+
+        echo "${resp}" | jq -r '.runners[] | "\(.name)\t\(.status)"' 2>/dev/null
+
+        local count
+        count="$(echo "${resp}" | jq -r '.runners | length' 2>/dev/null)"
+        if [[ "${count}" -lt 100 ]]; then
+            break
+        fi
+        page=$((page + 1))
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Helper: check if a runner name is taken by an ONLINE runner.
+# Returns 0 if taken (online), 1 if not found or offline.
+# ---------------------------------------------------------------------------
+is_runner_name_active() {
+    local name="$1"
+    local runner_list="$2"
+
+    echo "${runner_list}" | grep -q "^${name}	online$"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: deduplicate runner name. If the base name is taken by an active
+# (online) runner, append -1, -2, … up to -99 until a free name is found.
+# Offline runners with the same name are replaced, not incremented.
+# ---------------------------------------------------------------------------
+deduplicate_runner_name() {
+    local base_name="$1"
+
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    if [[ -z "${auth_token}" ]]; then
+        log "info" "No PAT available to check for active runners -- using name as-is" >&2
+        echo "${base_name}"
+        return 0
+    fi
+
+    local runner_list
+    runner_list="$(api_list_runners 2>/dev/null)" || {
+        log "warn" "Failed to list runners via API -- using name as-is" >&2
+        echo "${base_name}"
+        return 0
+    }
+
+    # If the base name isn't taken by an online runner, use it (--replace
+    # will handle any offline/stale entry)
+    if ! is_runner_name_active "${base_name}" "${runner_list}"; then
+        echo "${base_name}"
+        return 0
+    fi
+
+    # Base name is active -- find the next available suffix
+    local suffix=1
+    while [[ "${suffix}" -le 99 ]]; do
+        local candidate="${base_name}-${suffix}"
+        if ! is_runner_name_active "${candidate}" "${runner_list}"; then
+            log "info" "Runner '${base_name}' is already online, using '${candidate}' instead" >&2
+            echo "${candidate}"
+            return 0
+        fi
+        suffix=$((suffix + 1))
+    done
+
+    log "warn" "All suffixes ${base_name}-1 through ${base_name}-99 are active -- using base name with --replace" >&2
+    echo "${base_name}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: remove a runner from GitHub via the REST API by runner name.
+# Requires a PAT (GITHUB_PAT or GITHUB_TOKEN) - registration tokens don't
+# have the necessary scope.
+# ---------------------------------------------------------------------------
+api_remove_runner_by_name() {
+    local runner_name="$1"
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+
+    if [[ -z "${auth_token}" ]]; then
+        log "warn" "No PAT available to query the API for conflicting runners"
+        return 1
+    fi
+
+    local runners_url
+    runners_url="$(resolve_api_runners_url)"
+
+    local runner_list
+    runner_list="$(api_list_runners 2>/dev/null)" || {
+        log "warn" "Failed to list runners via API"
+        return 1
+    }
+
+    # Find the runner ID by name (need a separate call since list only gave name+status)
+    local page=1 runner_id=""
+    while [[ "${page}" -le 10 ]]; do
+        local resp
+        resp="$(curl -fsSL \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${runners_url}?per_page=100&page=${page}" 2>/dev/null)" || break
+
+        runner_id="$(echo "${resp}" | jq -r \
+            --arg name "${runner_name}" \
+            '.runners[] | select(.name == $name) | .id // empty' 2>/dev/null | head -n1)"
+
+        if [[ -n "${runner_id}" ]]; then
+            break
+        fi
+
+        local count
+        count="$(echo "${resp}" | jq -r '.runners | length' 2>/dev/null)"
+        if [[ "${count}" -lt 100 ]]; then
+            break
+        fi
+        page=$((page + 1))
+    done
+
+    if [[ -z "${runner_id}" ]]; then
+        log "info" "No existing runner named '${runner_name}' found via API"
+        return 0
+    fi
+
+    log "info" "Found existing runner '${runner_name}' (id: ${runner_id}), removing via API..."
+    local del_code
+    del_code="$(curl -fsSL -o /dev/null -w "%{http_code}" -X DELETE \
+        -H "Authorization: token ${auth_token}" \
+        -H "Accept: application/vnd.github+json" \
+        "${runners_url}/${runner_id}" 2>/dev/null)" || true
+
+    if [[ "${del_code}" == "204" ]]; then
+        log "info" "Successfully removed conflicting runner '${runner_name}' (id: ${runner_id}) via API"
+        return 0
+    else
+        log "warn" "API DELETE returned HTTP ${del_code} for runner id ${runner_id}"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: wipe local runner config files so config.sh starts clean
+# ---------------------------------------------------------------------------
+clean_local_runner_config() {
+    log "info" "Cleaning local runner configuration files"
+    rm -f .runner .credentials .credentials_rsaparams .env .path
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup long-offline runners (org / enterprise / repo scope).
+#
+# GitHub's API does not expose how long a runner has been offline, so we
+# track the first time we see each offline runner in a small JSON state
+# file under /config (persists across container restarts when /config is
+# mounted as a volume). Any runner that has been continuously observed as
+# offline for longer than CLEANUP_OFFLINE_AFTER seconds is removed via
+# DELETE /actions/runners/{id}. Runners that come back online are pruned
+# from the state file.
+#
+# Controlled by:
+#   CLEANUP_OFFLINE_RUNNERS    Master toggle. "true" enables the sweep.
+#                              Default: false (no API DELETE calls).
+#   CLEANUP_OFFLINE_AFTER      Seconds a runner must have been offline
+#                              before it qualifies for removal.
+#                              Default: 86400 (24h). Minimum 300 (5 min).
+#   CLEANUP_OFFLINE_NAME_REGEX Optional ERE pattern. When set, only runners
+#                              whose name matches are eligible (the
+#                              currently-registering RUNNER_NAME is always
+#                              skipped). Default: "" (= match all).
+#   CLEANUP_OFFLINE_DRY_RUN    "true" to log what WOULD be removed without
+#                              actually calling DELETE. Default: false.
+#   CLEANUP_OFFLINE_MAX        Hard cap on how many runners are removed in
+#                              a single sweep, as a safety brake against an
+#                              accidental mass-delete. Default: 25.
+#   CLEANUP_OFFLINE_IMMEDIATE  When "true", bypass the offline-since timer
+#                              and remove ANY runner currently reporting
+#                              offline (still subject to NAME_REGEX, MAX,
+#                              DRY_RUN, and the always-skip self-name).
+#                              Intended for fleets of ephemeral runners
+#                              where offline = container died and will
+#                              never reconnect, so there is no value in
+#                              waiting for CLEANUP_OFFLINE_AFTER to elapse.
+#                              Default: auto-enabled when RUNNER_EPHEMERAL=
+#                              true (override with "false" to opt out);
+#                              "false" otherwise.
+#
+# Requires a PAT (GITHUB_PAT or GITHUB_TOKEN) with the same scope used to
+# register runners. Silently no-ops when no PAT is available.
+# ---------------------------------------------------------------------------
+CLEANUP_STATE_FILE="/config/.gh-runner-offline-state.json"
+
+cleanup_stale_offline_runners() {
+    [[ "${CLEANUP_OFFLINE_RUNNERS:-false}" == "true" ]] || return 0
+
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    if [[ -z "${auth_token}" ]]; then
+        log "warn" "CLEANUP_OFFLINE_RUNNERS=true but no PAT available -- skipping (need GITHUB_PAT or GITHUB_TOKEN)"
+        return 0
+    fi
+
+    # Validate threshold (seconds). Reject anything below 300s so a typo
+    # like "60" can't wipe runners that just briefly disconnected.
+    local threshold="${CLEANUP_OFFLINE_AFTER:-86400}"
+    if ! [[ "${threshold}" =~ ^[0-9]+$ ]] || (( threshold < 300 )); then
+        log "warn" "CLEANUP_OFFLINE_AFTER='${CLEANUP_OFFLINE_AFTER:-}' invalid (must be >=300 seconds); using default 86400"
+        threshold=86400
+    fi
+
+    local max_remove="${CLEANUP_OFFLINE_MAX:-25}"
+    if ! [[ "${max_remove}" =~ ^[0-9]+$ ]] || (( max_remove < 1 )); then
+        max_remove=25
+    fi
+
+    local name_regex="${CLEANUP_OFFLINE_NAME_REGEX:-}"
+    local dry_run="${CLEANUP_OFFLINE_DRY_RUN:-false}"
+
+    # Immediate mode: skip the offline-since timer entirely. Defaults ON in
+    # ephemeral mode (offline ephemeral runners are dead by definition) and
+    # OFF for persistent runners (so a brief network blip doesn't trigger a
+    # mass delete). User can explicitly override either way.
+    local immediate_default="false"
+    if [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]]; then
+        immediate_default="true"
+    fi
+    local immediate="${CLEANUP_OFFLINE_IMMEDIATE:-${immediate_default}}"
+
+    if [[ "${immediate}" == "true" ]]; then
+        log "info" "Stale-runner cleanup: scanning offline runners (IMMEDIATE mode -- no offline-since grace, dry_run=${dry_run}, max=${max_remove}, regex='${name_regex:-<all>}')"
+    else
+        log "info" "Stale-runner cleanup: scanning offline runners (threshold=${threshold}s, dry_run=${dry_run}, max=${max_remove}, regex='${name_regex:-<all>}')"
+    fi
+
+    local runners_url
+    runners_url="$(resolve_api_runners_url)"
+    log "info" "Stale-runner cleanup: API endpoint ${runners_url}"
+
+    # Fetch all runners with id+name+status (paginate).
+    #
+    # Defensive logging: each network/jq step has its own error branch and
+    # logs progress so a hung enterprise listing is distinguishable from
+    # a silent jq parse failure (which would otherwise terminate the
+    # script under `set -euo pipefail` with no output at all).
+    local now
+    now="$(date +%s)"
+    local current_json="[]"
+    local total_seen=0
+
+    local page=1
+    while [[ "${page}" -le 10 ]]; do
+        local resp http_code curl_rc
+        # Capture body and HTTP code in one call so we can distinguish
+        # auth/scope errors (401/403/404) from transport failures.
+        local body_file="/tmp/.gh-runner-cleanup-page.$$"
+        http_code="$(curl -sSL --max-time 12 \
+            -o "${body_file}" \
+            -w "%{http_code}" \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${runners_url}?per_page=100&page=${page}" 2>/dev/null)"
+        curl_rc=$?
+        if [[ "${curl_rc}" -ne 0 ]]; then
+            log "warn" "Stale-runner cleanup: curl failed listing runners (page ${page}, exit=${curl_rc}) -- aborting sweep"
+            rm -f "${body_file}"
+            return 0
+        fi
+        if [[ "${http_code}" != "200" ]]; then
+            local err_msg
+            err_msg="$(jq -r '.message // empty' < "${body_file}" 2>/dev/null || true)"
+            log "warn" "Stale-runner cleanup: API returned HTTP ${http_code} on page ${page}${err_msg:+ -- ${err_msg}} -- aborting sweep"
+            rm -f "${body_file}"
+            return 0
+        fi
+        resp="$(cat "${body_file}")"
+        rm -f "${body_file}"
+
+        local page_items
+        if ! page_items="$(echo "${resp}" | jq -c '[.runners[]? | {id, name, status}]' 2>/dev/null)" \
+           || [[ -z "${page_items}" ]]; then
+            log "warn" "Stale-runner cleanup: malformed API response on page ${page} (no .runners[]) -- aborting sweep"
+            return 0
+        fi
+
+        local count
+        count="$(echo "${page_items}" | jq 'length' 2>/dev/null || echo 0)"
+        total_seen=$((total_seen + count))
+        log "debug" "Stale-runner cleanup: page ${page} returned ${count} runner(s) (running total ${total_seen})"
+
+        if ! current_json="$(jq -c --argjson a "${current_json}" --argjson b "${page_items}" -n '$a + $b' 2>/dev/null)"; then
+            log "warn" "Stale-runner cleanup: jq concat failed on page ${page} -- aborting sweep"
+            return 0
+        fi
+
+        [[ "${count}" -lt 100 ]] && break
+        page=$((page + 1))
+    done
+
+    log "info" "Stale-runner cleanup: fetched ${total_seen} runner(s) across ${page} page(s)"
+
+    # Load (or initialize) the offline state file. State shape:
+    #   { "<runner-name>": <epoch-first-seen-offline> }
+    local state_json="{}"
+    if [[ -f "${CLEANUP_STATE_FILE}" ]]; then
+        state_json="$(cat "${CLEANUP_STATE_FILE}" 2>/dev/null)"
+        if ! echo "${state_json}" | jq -e . >/dev/null 2>&1; then
+            log "warn" "Stale-runner cleanup: state file is corrupt, resetting"
+            state_json="{}"
+        fi
+    fi
+
+    # Build the new state: for every currently-offline runner, carry forward
+    # its first-seen timestamp (or seed with `now` if new). Drop entries for
+    # runners that are now online or no longer exist.
+    local new_state
+    if ! new_state="$(jq -c \
+        --argjson runners "${current_json}" \
+        --argjson now "${now}" \
+        --argjson old "${state_json}" \
+        -n '
+            ($runners | map(select(.status == "offline") | .name)) as $offline_names
+            | reduce $offline_names[] as $n ({}; . + { ($n): ($old[$n] // $now) })
+        ' 2>/dev/null)"; then
+        log "warn" "Stale-runner cleanup: jq failed building offline-state map -- aborting sweep"
+        return 0
+    fi
+
+    local offline_count
+    offline_count="$(echo "${current_json}" | jq -r '[.[] | select(.status == "offline")] | length' 2>/dev/null || echo 0)"
+    log "info" "Stale-runner cleanup: ${offline_count} runner(s) currently offline (self='${RUNNER_NAME}' will be skipped)"
+
+    # Determine which runners exceed the threshold (and match the optional regex)
+    # Output: TSV lines "<id>\t<name>\t<offline_seconds>"
+    # In IMMEDIATE mode the threshold filter is replaced with `>= 0` so every
+    # offline runner qualifies regardless of how long the state file says
+    # it has been offline (state file may not even exist on first boot of
+    # an ephemeral container).
+    local effective_threshold="${threshold}"
+    if [[ "${immediate}" == "true" ]]; then
+        effective_threshold=0
+    fi
+    local victims
+    if ! victims="$(jq -r \
+        --argjson runners "${current_json}" \
+        --argjson now "${now}" \
+        --argjson threshold "${effective_threshold}" \
+        --arg regex "${name_regex}" \
+        --arg self_name "${RUNNER_NAME}" \
+        --argjson state "${new_state}" \
+        -n '
+            $runners
+            | map(select(.status == "offline"))
+            | map(select(.name != $self_name))
+            | map(select($regex == "" or (.name | test($regex))))
+            | map({
+                id: .id,
+                name: .name,
+                offline_for: ($now - ($state[.name] // $now))
+              })
+            | map(select(.offline_for >= $threshold))
+            | .[]
+            | "\(.id)\t\(.name)\t\(.offline_for)"
+        ' 2>/dev/null)"; then
+        log "warn" "Stale-runner cleanup: jq failed selecting victims -- aborting sweep"
+        return 0
+    fi
+
+    # Persist the new state (best-effort -- /config may be read-only in some setups)
+    if [[ -w "/config" || ! -e "${CLEANUP_STATE_FILE}" ]]; then
+        echo "${new_state}" > "${CLEANUP_STATE_FILE}.tmp" 2>/dev/null \
+            && mv -f "${CLEANUP_STATE_FILE}.tmp" "${CLEANUP_STATE_FILE}" 2>/dev/null \
+            || log "debug" "Stale-runner cleanup: could not persist state file"
+        chown abc:abc "${CLEANUP_STATE_FILE}" 2>/dev/null || true
+    fi
+
+    if [[ -z "${victims}" ]]; then
+        log "info" "Stale-runner cleanup: nothing to remove (0 candidates after filters)"
+        return 0
+    fi
+
+    local victim_count
+    victim_count="$(echo "${victims}" | wc -l | tr -d ' ')"
+    log "info" "Stale-runner cleanup: ${victim_count} candidate(s) selected, capped at max=${max_remove}"
+
+    local removed=0 skipped=0 failed=0
+    local IFS=$'\n'
+    for line in ${victims}; do
+        if (( removed >= max_remove )); then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        local rid rname rfor
+        rid="$(echo "${line}" | cut -f1)"
+        rname="$(echo "${line}" | cut -f2)"
+        rfor="$(echo "${line}" | cut -f3)"
+
+        if [[ "${dry_run}" == "true" ]]; then
+            if [[ "${immediate}" == "true" ]]; then
+                log "info" "Stale-runner cleanup: [DRY RUN] would remove '${rname}' (id=${rid}, status=offline, immediate)"
+            else
+                log "info" "Stale-runner cleanup: [DRY RUN] would remove '${rname}' (id=${rid}, offline ${rfor}s)"
+            fi
+            removed=$((removed + 1))
+            continue
+        fi
+
+        local del_code del_body_file="/tmp/.gh-runner-cleanup-del.$$"
+        del_code="$(curl -sSL --max-time 6 -o "${del_body_file}" -w "%{http_code}" -X DELETE \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${runners_url}/${rid}" 2>/dev/null)" || del_code="000"
+
+        if [[ "${del_code}" == "204" ]]; then
+            if [[ "${immediate}" == "true" ]]; then
+                log "info" "Stale-runner cleanup: removed '${rname}' (id=${rid}, status=offline, immediate)"
+            else
+                log "info" "Stale-runner cleanup: removed '${rname}' (id=${rid}, offline ${rfor}s)"
+            fi
+            removed=$((removed + 1))
+        else
+            local del_msg
+            del_msg="$(jq -r '.message // empty' < "${del_body_file}" 2>/dev/null || true)"
+            log "warn" "Stale-runner cleanup: failed to remove '${rname}' (id=${rid}, HTTP ${del_code}${del_msg:+ -- ${del_msg}})"
+            failed=$((failed + 1))
+        fi
+        rm -f "${del_body_file}"
+    done
+    unset IFS
+
+    log "info" "Stale-runner cleanup: removed=${removed} failed=${failed} skipped(over-cap)=${skipped}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: resolve the GitHub API runner-groups URL for the configured scope.
+# Runner groups are only available at org and enterprise levels.
+# ---------------------------------------------------------------------------
+resolve_api_runner_groups_url() {
+    local url_path="${RUNNER_URL#https://github.com/}"
+    url_path="${url_path%/}"
+    local api_base="https://api.github.com"
+
+    if [[ "${url_path}" == enterprises/* ]]; then
+        echo "${api_base}/enterprises/${url_path#enterprises/}/actions/runner-groups"
+    elif [[ "${url_path}" == */* ]]; then
+        # Repo-level runners don't support custom groups
+        echo ""
+    else
+        echo "${api_base}/orgs/${url_path}/actions/runner-groups"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: ensure the runner group exists, creating it if necessary.
+# Requires a PAT with admin:org scope (org) or manage_runners:enterprise.
+# ---------------------------------------------------------------------------
+ensure_runner_group() {
+    local group_name="${1:-Default}"
+
+    log "info" "Runner group check: verifying group '${group_name}'"
+
+    # "Default" always exists; nothing to do
+    if [[ "${group_name}" == "Default" ]]; then
+        log "info" "Runner group check: 'Default' is built-in, no action required"
+        return 0
+    fi
+
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    if [[ -z "${auth_token}" ]]; then
+        log "warn" "Runner group check: no PAT available to verify/create '${group_name}'"
+        log "warn" "  Group creation requires PAT with 'admin:org' (org) or 'manage_runners:enterprise' (enterprise)"
+        log "warn" "  Without it, registration will fall back to whatever group config.sh resolves (usually Default)"
+        return 0
+    fi
+
+    local groups_url
+    groups_url="$(resolve_api_runner_groups_url)"
+    if [[ -z "${groups_url}" ]]; then
+        log "warn" "Runner group check: groups are not supported at the repo level -- ignoring RUNNER_GROUP='${group_name}'"
+        return 0
+    fi
+
+    # Paginate through existing groups to see if it already exists
+    local page=1 found="false"
+    while [[ "${page}" -le 10 ]]; do
+        local resp
+        resp="$(curl -fsSL \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${groups_url}?per_page=100&page=${page}" 2>/dev/null)" || {
+            log "warn" "Failed to list runner groups via API"
+            return 1
+        }
+
+        if echo "${resp}" | jq -e --arg name "${group_name}" \
+            '.runner_groups[] | select(.name == $name)' >/dev/null 2>&1; then
+            found="true"
+            break
+        fi
+
+        local count
+        count="$(echo "${resp}" | jq -r '.runner_groups | length' 2>/dev/null)"
+        if [[ "${count}" -lt 100 ]]; then
+            break
+        fi
+        page=$((page + 1))
+    done
+
+    if [[ "${found}" == "true" ]]; then
+        log "info" "Runner group check: '${group_name}' already exists -- no changes needed"
+        return 0
+    fi
+
+    log "info" "Runner group check: '${group_name}' not found -- attempting to create it via API"
+
+    local create_resp create_code
+    create_resp="$(curl -fsSL -w "\n%{http_code}" -X POST \
+        -H "Authorization: token ${auth_token}" \
+        -H "Accept: application/vnd.github+json" \
+        -d "$(jq -nc --arg name "${group_name}" '{name: $name, visibility: "all"}')" \
+        "${groups_url}" 2>&1)" || {
+        log "warn" "Failed to create runner group '${group_name}'"
+        return 1
+    }
+
+    local body code
+    body="$(echo "${create_resp}" | head -n -1)"
+    code="$(echo "${create_resp}" | tail -n 1)"
+
+    if [[ "${code}" == "201" ]]; then
+        log "info" "Runner group check: '${group_name}' created successfully"
+        return 0
+    else
+        log "warn" "Runner group check: GitHub API returned HTTP ${code} when creating '${group_name}'"
+        log "warn" "  Response: ${body}"
+        log "warn" "  Required privileges: PAT with 'admin:org' (org-level) or 'manage_runners:enterprise' (enterprise-level)"
+        log "warn" "  Renaming/adjusting existing groups must be done manually in GitHub Settings -> Actions -> Runner groups"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: fetch a runner's id, custom labels, and runner_group_id by name.
+# Outputs three TAB-separated fields: "<id>\t<comma-labels>\t<group_id>".
+# Empty output if not found or API unavailable.
+# ---------------------------------------------------------------------------
+api_get_runner_metadata() {
+    local runner_name="$1"
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    [[ -n "${auth_token}" ]] || return 1
+
+    local runners_url
+    runners_url="$(resolve_api_runners_url)"
+
+    local page=1
+    while [[ "${page}" -le 10 ]]; do
+        local resp
+        resp="$(curl -fsSL \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${runners_url}?per_page=100&page=${page}" 2>/dev/null)" || return 1
+
+        local match
+        match="$(echo "${resp}" | jq -r \
+            --arg name "${runner_name}" '
+                .runners[]
+                | select(.name == $name)
+                | [
+                    (.id | tostring),
+                    ([.labels[] | select(.type == "custom") | .name] | join(",")),
+                    ((.runner_group_id // 1) | tostring)
+                  ]
+                | @tsv
+            ' 2>/dev/null | head -n1)"
+
+        if [[ -n "${match}" ]]; then
+            echo "${match}"
+            return 0
+        fi
+
+        local count
+        count="$(echo "${resp}" | jq -r '.runners | length' 2>/dev/null)"
+        [[ "${count}" -lt 100 ]] && break
+        page=$((page + 1))
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Helper: replace the custom labels on an existing runner.
+# Args: <runner_id> <comma-separated labels>
+# Returns 0 on success, non-zero otherwise.
+# ---------------------------------------------------------------------------
+api_set_runner_labels() {
+    local runner_id="$1"
+    local labels_csv="$2"
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+
+    if [[ -z "${auth_token}" ]]; then
+        log "warn" "No PAT available to update runner labels via API"
+        return 1
+    fi
+
+    local runners_url
+    runners_url="$(resolve_api_runners_url)"
+
+    local payload
+    payload="$(echo "${labels_csv}" | jq -R -c 'split(",") | map(select(length > 0)) | {labels: .}')"
+
+    local resp code
+    resp="$(curl -fsSL -w "\n%{http_code}" -X PUT \
+        -H "Authorization: token ${auth_token}" \
+        -H "Accept: application/vnd.github+json" \
+        -d "${payload}" \
+        "${runners_url}/${runner_id}/labels" 2>&1)" || true
+
+    code="$(echo "${resp}" | tail -n 1)"
+    if [[ "${code}" == "200" ]]; then
+        return 0
+    fi
+
+    log "warn" "GitHub API returned HTTP ${code} when updating runner labels"
+    log "warn" "Response: $(echo "${resp}" | head -n -1)"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Helper: look up a runner group's numeric id by name.
+# Outputs the id or empty.
+# ---------------------------------------------------------------------------
+api_get_runner_group_id() {
+    local group_name="$1"
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    [[ -n "${auth_token}" ]] || return 1
+
+    local groups_url
+    groups_url="$(resolve_api_runner_groups_url)"
+    [[ -n "${groups_url}" ]] || return 1
+
+    local page=1
+    while [[ "${page}" -le 10 ]]; do
+        local resp
+        resp="$(curl -fsSL \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${groups_url}?per_page=100&page=${page}" 2>/dev/null)" || return 1
+
+        local gid
+        gid="$(echo "${resp}" | jq -r \
+            --arg name "${group_name}" \
+            '.runner_groups[] | select(.name == $name) | .id // empty' 2>/dev/null | head -n1)"
+
+        if [[ -n "${gid}" ]]; then
+            echo "${gid}"
+            return 0
+        fi
+
+        local count
+        count="$(echo "${resp}" | jq -r '.runner_groups | length' 2>/dev/null)"
+        [[ "${count}" -lt 100 ]] && break
+        page=$((page + 1))
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Helper: move a runner into the specified runner group (org/enterprise only).
+# Args: <runner_id> <group_id>
+# ---------------------------------------------------------------------------
+api_set_runner_group() {
+    local runner_id="$1"
+    local group_id="$2"
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+
+    if [[ -z "${auth_token}" ]]; then
+        log "warn" "No PAT available to move runner to a different group"
+        return 1
+    fi
+
+    local groups_url
+    groups_url="$(resolve_api_runner_groups_url)"
+    if [[ -z "${groups_url}" ]]; then
+        log "warn" "Runner groups are not supported at the repo level -- cannot change group"
+        return 1
+    fi
+
+    local resp code
+    resp="$(curl -fsSL -w "\n%{http_code}" -X PUT \
+        -H "Authorization: token ${auth_token}" \
+        -H "Accept: application/vnd.github+json" \
+        "${groups_url}/${group_id}/runners/${runner_id}" 2>&1)" || true
+
+    code="$(echo "${resp}" | tail -n 1)"
+    if [[ "${code}" == "204" ]]; then
+        return 0
+    fi
+
+    log "warn" "GitHub API returned HTTP ${code} when moving runner to group ${group_id}"
+    log "warn" "Response: $(echo "${resp}" | head -n -1)"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Helper: compare desired labels/group against the runner's current values
+# on GitHub and update them via the API if they differ. Used when a local
+# .runner config is reused (no re-registration required).
+# ---------------------------------------------------------------------------
+sync_existing_runner_metadata() {
+    local runner_name="$1"
+    local desired_labels="$2"
+    local desired_group="${3:-Default}"
+
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    if [[ -z "${auth_token}" ]]; then
+        log "info" "No PAT available -- skipping label/group sync for existing runner"
+        return 0
+    fi
+
+    local meta
+    meta="$(api_get_runner_metadata "${runner_name}" 2>/dev/null)" || {
+        log "warn" "Failed to query GitHub API for runner '${runner_name}' metadata"
+        return 0
+    }
+
+    if [[ -z "${meta}" ]]; then
+        log "warn" "Runner '${runner_name}' not found via API -- it may need re-registration"
+        return 0
+    fi
+
+    local runner_id current_labels current_group_id
+    runner_id="$(echo "${meta}" | cut -f1)"
+    current_labels="$(echo "${meta}" | cut -f2)"
+    current_group_id="$(echo "${meta}" | cut -f3)"
+
+    # ----- Labels sync -----
+    # Normalize both sides: split, trim, sort, dedupe, then compare.
+    local normalize='tr "," "\n" | sed "s/^[[:space:]]*//;s/[[:space:]]*$//" | grep -v "^$" | sort -u | paste -sd "," -'
+    local desired_norm current_norm
+    desired_norm="$(echo "${desired_labels}" | eval "${normalize}")"
+    current_norm="$(echo "${current_labels}" | eval "${normalize}")"
+
+    if [[ "${desired_norm}" != "${current_norm}" ]]; then
+        log "info" "Custom labels differ -- updating via API"
+        log "info" "  current: ${current_norm:-(none)}"
+        log "info" "  desired: ${desired_norm:-(none)}"
+        if api_set_runner_labels "${runner_id}" "${desired_norm}"; then
+            log "info" "Runner labels updated successfully"
+        else
+            log "warn" "Failed to update runner labels -- they will only be refreshed on next re-registration"
+        fi
+    else
+        log "info" "Runner labels already up to date"
+    fi
+
+    # ----- Runner group sync (org/enterprise only) -----
+    local groups_url
+    groups_url="$(resolve_api_runner_groups_url)"
+    if [[ -z "${groups_url}" ]]; then
+        # Repo-scope: no groups, nothing to sync
+        return 0
+    fi
+
+    local desired_group_id
+    desired_group_id="$(api_get_runner_group_id "${desired_group}" 2>/dev/null)"
+    if [[ -z "${desired_group_id}" ]]; then
+        log "warn" "Runner group '${desired_group}' not found -- cannot sync group membership"
+        return 0
+    fi
+
+    if [[ "${desired_group_id}" != "${current_group_id}" ]]; then
+        log "info" "Runner group differs -- moving runner to '${desired_group}' (id: ${desired_group_id})"
+        if api_set_runner_group "${runner_id}" "${desired_group_id}"; then
+            log "info" "Runner group updated successfully"
+        else
+            log "warn" "Failed to move runner to group '${desired_group}'"
+        fi
+    else
+        log "info" "Runner group already up to date ('${desired_group}')"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Runner configuration
+# ---------------------------------------------------------------------------
+
+# Optional: prune long-offline runners from GitHub before we register so
+# old ephemeral instances don't accumulate. No-op unless
+# CLEANUP_OFFLINE_RUNNERS=true and a PAT/GITHUB_TOKEN is available.
+stage_begin "stale offline-runner cleanup (CLEANUP_OFFLINE_RUNNERS=${CLEANUP_OFFLINE_RUNNERS:-false})"
+cleanup_stale_offline_runners
+stage_end
+
+# Ensure the runner group exists before attempting configuration
+stage_begin "runner-group check (RUNNER_GROUP=${RUNNER_GROUP:-Default})"
+ensure_runner_group "${RUNNER_GROUP:-Default}"
+stage_end
+
+# Deduplicate runner name: if an online runner already has this name, append
+# -1, -2, … so multiple containers can coexist without clobbering each other.
+# Offline/stale runners with the same name are replaced instead.
+stage_begin "runner name deduplication (base='${RUNNER_NAME}')"
+RUNNER_NAME="$(deduplicate_runner_name "${RUNNER_NAME}")"
+export RUNNER_NAME
+log "info" "Final runner name: ${RUNNER_NAME}"
+stage_end
+
+if [[ -f ".runner" ]] && [[ "${RUNNER_EPHEMERAL:-false}" != "true" ]]; then
+    # Verify the existing config still points to the same URL & name
+    local_url="$(jq -r '.gitHubUrl // empty' .runner 2>/dev/null)"
+    local_name="$(jq -r '.agentName // empty' .runner 2>/dev/null)"
+
+    if [[ "${local_url}" == "${RUNNER_URL}" && "${local_name}" == "${RUNNER_NAME}" ]]; then
+        log "info" "Runner already configured (found .runner file), skipping reconfiguration"
+        # Sync labels and runner group with GitHub in case they changed since
+        # the last registration (e.g. RUNNER_LABELS or RUNNER_GROUP env updated).
+        sync_existing_runner_metadata \
+            "${RUNNER_NAME}" \
+            "${RUNNER_LABELS:-}" \
+            "${RUNNER_GROUP:-Default}"
+    else
+        log "info" "Runner config mismatch (local: ${local_name}@${local_url}, wanted: ${RUNNER_NAME}@${RUNNER_URL})"
+        log "info" "Attempting to deregister old runner before reconfiguring"
+        as_runner_user ./config.sh remove --token "${RUNNER_TOKEN}" 2>/dev/null || {
+            log "warn" "Local deregistration failed (token scope may differ); cleaning local config"
+            clean_local_runner_config
+        }
+        # Fall through to the configuration block below
+    fi
+fi
+
+if [[ ! -f ".runner" ]]; then
+    stage_begin "runner registration via config.sh (this contacts GitHub and may take a few seconds)"
+    log "info" "Configuring runner..."
+    log "info" "  URL:       ${RUNNER_URL}"
+    log "info" "  Name:      ${RUNNER_NAME}"
+    log "info" "  Work dir:  ${RUNNER_WORKDIR}"
+    log "info" "  Ephemeral: ${RUNNER_EPHEMERAL:-false}"
+    log "info" "  Labels:    ${RUNNER_LABELS:-default}"
+    log "info" "  Group:     ${RUNNER_GROUP:-Default}"
+
+    CONFIG_ARGS=(
+        --unattended
+        --url "${RUNNER_URL}"
+        --token "${RUNNER_TOKEN}"
+        --name "${RUNNER_NAME}"
+        --work "${RUNNER_WORKDIR}"
+        --replace
+    )
+
+    if [[ -n "${RUNNER_LABELS:-}" ]]; then
+        CONFIG_ARGS+=(--labels "${RUNNER_LABELS}")
+    fi
+
+    if [[ -n "${RUNNER_GROUP:-}" ]]; then
+        CONFIG_ARGS+=(--runnergroup "${RUNNER_GROUP}")
+    fi
+
+    if [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]]; then
+        CONFIG_ARGS+=(--ephemeral)
+    fi
+
+    if [[ "${DISABLE_RUNNER_UPDATE:-false}" == "true" ]]; then
+        CONFIG_ARGS+=(--disableupdate)
+    fi
+
+    # First attempt -- capture stderr/stdout to diagnose failures
+    config_output=""
+    if ! config_output="$(as_runner_user ./config.sh "${CONFIG_ARGS[@]}" 2>&1)"; then
+        printf '%s\n' "${config_output}" | prefix_lines config
+
+        # Check if the error is a label validation issue -- retrying won't help
+        if echo "${config_output}" | grep -qi "Label.*is not valid"; then
+            log "fatal" "config.sh failed due to invalid labels: ${RUNNER_LABELS}"
+            log "fatal" "Ensure labels do not contain leading/trailing spaces and are under 256 characters"
+            exit 1
+        fi
+
+        log "warn" "config.sh failed -- likely a name conflict or stale registration"
+
+        # Try to force-remove the conflicting runner via the API
+        if api_remove_runner_by_name "${RUNNER_NAME}"; then
+            log "info" "Retrying config.sh after API removal..."
+            clean_local_runner_config
+            as_runner_user ./config.sh "${CONFIG_ARGS[@]}" 2>&1 | prefix_lines config
+        else
+            log "fatal" "Unable to resolve runner name conflict for '${RUNNER_NAME}'"
+            log "fatal" "Ensure the PAT has admin scope or manually remove the stale runner from GitHub"
+            exit 1
+        fi
+    else
+        printf '%s\n' "${config_output}" | prefix_lines config
+    fi
+
+    log "info" "Runner configured successfully"
+    stage_end
+fi
+
+RUNNER_VER="$(cat /opt/runner-bin/bin/Runner.Listener.deps.json 2>/dev/null \
+    | jq -r '.runtimeTarget.name' 2>/dev/null || echo "unknown")"
+
+mkdir -p /run/s6/container_environment
+printf '%s' "${RUNNER_NAME}" > /run/s6/container_environment/RUNNER_NAME
+printf '%s' "${RUNNER_URL}" > /run/s6/container_environment/RUNNER_URL
+printf '%s' "${RUNNER_WORKDIR}" > /run/s6/container_environment/RUNNER_WORKDIR
+
+
+if [[ -n "${RUNNER_ENV_FILE:-}" ]]; then
+    if [[ -f "${RUNNER_ENV_FILE}" && -r "${RUNNER_ENV_FILE}" ]]; then
+        log "info" "Loading environment variables from ${RUNNER_ENV_FILE}"
+        local_count=0
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+            line="${line%%[[:space:]]#*}"
+            if [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                local_key="${BASH_REMATCH[1]}"
+                local_val="${BASH_REMATCH[2]}"
+                if [[ "${local_val}" =~ ^\"(.*)\"$ ]] || [[ "${local_val}" =~ ^\'(.*)\'$ ]]; then
+                    local_val="${BASH_REMATCH[1]}"
+                fi
+                export "${local_key}=${local_val}"
+                printf '%s' "${local_val}" > "/run/s6/container_environment/${local_key}"
+                local_count=$((local_count + 1))
+            else
+                log "warn" "Skipping invalid line in env file: ${line}"
+            fi
+        done < "${RUNNER_ENV_FILE}"
+        log "info" "Loaded ${local_count} environment variable(s) from env file"
+    else
+        log "fatal" "RUNNER_ENV_FILE is set to '${RUNNER_ENV_FILE}' but the file does not exist or is not readable"
+        exit 1
+    fi
+fi
+
+if [[ -n "${RUNNER_SECRETS_DIR:-}" ]]; then
+    if [[ -d "${RUNNER_SECRETS_DIR}" && -r "${RUNNER_SECRETS_DIR}" ]]; then
+        log "info" "Loading secrets from directory ${RUNNER_SECRETS_DIR}"
+        local_count=0
+        for secret_file in "${RUNNER_SECRETS_DIR}"/*; do
+            [[ -f "${secret_file}" && -r "${secret_file}" ]] || continue
+            local_key="$(basename "${secret_file}")"
+            [[ "${local_key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+                log "warn" "Skipping '${local_key}' -- not a valid env var name"
+                continue
+            }
+            local_val="$(< "${secret_file}")"
+            local_val="${local_val%%$'\n'}"
+            export "${local_key}=${local_val}"
+            printf '%s' "${local_val}" > "/run/s6/container_environment/${local_key}"
+            local_count=$((local_count + 1))
+        done
+        log "info" "Loaded ${local_count} secret(s) from directory"
+    else
+        log "fatal" "RUNNER_SECRETS_DIR is set to '${RUNNER_SECRETS_DIR}' but the directory does not exist or is not readable"
+        exit 1
+    fi
+fi
+
+mask_secret() {
+    local val="$1"
+    if [[ -z "${val}" ]]; then
+        echo "(not set)"
+    else
+        echo "(set)"
+    fi
+}
+
+# Show optional values consistently as "(not set)" when blank, otherwise
+# print the value as-is. Keeps the banner aligned and avoids empty cells.
+show_or_unset() {
+    local val="$1"
+    if [[ -z "${val}" ]]; then
+        echo "(not set)"
+    else
+        echo "${val}"
+    fi
+}
+
+# Pull build-stamped metadata baked in at image build time.
+APP_VERSION_BANNER="unknown"
+RUNNER_ARCH_BANNER="$(uname -m)"
+BUILD_DATE_BANNER="unknown"
+if [[ -r /etc/gh-runner/build-info ]]; then
+    # shellcheck disable=SC1091
+    . /etc/gh-runner/build-info
+    APP_VERSION_BANNER="${APP_VERSION:-unknown}"
+    RUNNER_ARCH_BANNER="${RUNNER_ARCH:-$(uname -m)}"
+    BUILD_DATE_BANNER="${BUILD_DATE:-unknown}"
+fi
+
+# Auth method summary -- show which credential will actually be used (priority
+# order: RUNNER_TOKEN > GITHUB_PAT > GITHUB_TOKEN). Never print the value.
+auth_method_summary() {
+    if [[ -n "${RUNNER_TOKEN:-}" ]]; then
+        echo "RUNNER_TOKEN (registration token)"
+    elif [[ -n "${GITHUB_PAT:-}" ]]; then
+        echo "GITHUB_PAT (Personal Access Token -> mints registration token)"
+    elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        echo "GITHUB_TOKEN (repo secret / app token -> mints registration token)"
+    else
+        echo "(none -- registration will fail)"
+    fi
+}
+
+# Detected runtime mode -- useful when troubleshooting.
+runtime_mode_summary() {
+    local parts=()
+    if [[ "${RUN_AS_NONROOT:-0}" == "1" ]]; then
+        parts+=("non-root (--user uid=${CURRENT_UID:-?})")
+    else
+        parts+=("root -> drops to abc (uid 911)")
+    fi
+    # The runner now runs directly from /opt/runner-bin (no separate
+    # runtime tree). Detect when the operator has mounted a tmpfs over it
+    # (read_only:true setups) so the banner can flag the read-only-friendly
+    # mode without requiring an env opt-in.
+    local rt_dev img_dev
+    rt_dev="$(stat -c '%d' /opt/runner-bin 2>/dev/null || echo 0)"
+    img_dev="$(stat -c '%d' /opt 2>/dev/null || echo 0)"
+    if [[ "${rt_dev}" != "0" && "${img_dev}" != "0" && "${rt_dev}" != "${img_dev}" ]]; then
+        parts+=("read-only friendly (tmpfs runtime)")
+    fi
+    (IFS=,; echo "${parts[*]}")
+}
+
+BANNER_LINE="======================================================================="
+BANNER_THIN="-----------------------------------------------------------------------"
+
+{
+echo ""
+echo "${BANNER_LINE}"
+echo "  blackoutsecure/docker-github-runner -- GitHub Actions Self-Hosted Runner"
+echo "  Image v${APP_VERSION_BANNER} (${RUNNER_ARCH_BANNER})  |  built ${BUILD_DATE_BANNER}"
+echo "  Sponsored by Blackout Secure (https://blackoutsecure.app)"
+echo "  Licensed MIT  |  https://github.com/blackoutsecure/docker-github-runner"
+echo "${BANNER_THIN}"
+echo "  Runtime"
+echo "    Mode             : $(runtime_mode_summary)"
+echo "    Container Host   : $(hostname)"
+echo "    Started At       : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+echo "    Timezone         : $(show_or_unset "${TZ:-}")"
+echo "    Log Level        : ${LOG_LEVEL:-info}"
+echo "${BANNER_THIN}"
+echo "  Runner identity"
+echo "    Name             : ${RUNNER_NAME:-$(hostname)} (${RUNNER_NAME_SOURCE:-unknown})"
+echo "    URL              : $(show_or_unset "${RUNNER_URL:-}")"
+echo "    Group            : ${RUNNER_GROUP:-Default}"
+echo "    Labels           : ${RUNNER_LABELS:-(default)}"
+echo "    Work Directory   : ${RUNNER_WORKDIR:-/config/work}"
+echo "${BANNER_THIN}"
+echo "  Behavior"
+echo "    Ephemeral        : ${RUNNER_EPHEMERAL:-false}"
+echo "    Replace Existing : ${RUNNER_REPLACE_EXISTING:-true}"
+echo "    Disable Update   : ${DISABLE_RUNNER_UPDATE:-false}"
+echo "    Auto Docker Label: ${AUTO_DOCKER_LABEL:-${DOCKER_IN_DOCKER:-false}}"
+echo "    Docker-in-Docker : ${DOCKER_IN_DOCKER:-false}"
+echo "${BANNER_THIN}"
+echo "  Health & recovery"
+echo "    Heartbeat        : every ${HEARTBEAT_INTERVAL:-120}s (HEARTBEAT_INTERVAL)"
+echo "    Job Heartbeat    : every ${JOB_HEARTBEAT_INTERVAL:-120}s while a job runs (0=off; JOB_HEARTBEAT_INTERVAL)"
+echo "    Online Probe     : every ${ONLINE_PROBE_EVERY:-1} heartbeat(s)"
+echo "    Offline Threshold: ${ONLINE_FAIL_THRESHOLD:-3}"
+echo "    On Offline       : ${ON_OFFLINE_ACTION:-restart}"
+echo "    Stale After      : ${HEALTH_STALE_AFTER:-300}s"
+echo "    s6 Gracetime     : svc=${S6_SERVICES_GRACETIME:-30000}ms kill=${S6_KILL_GRACETIME:-30000}ms"
+echo "${BANNER_THIN}"
+echo "  Stale offline-runner cleanup"
+echo "    Enabled          : ${CLEANUP_OFFLINE_RUNNERS:-false}"
+echo "    Offline After    : ${CLEANUP_OFFLINE_AFTER:-86400}s"
+echo "    Immediate Mode   : ${CLEANUP_OFFLINE_IMMEDIATE:-(auto: $( [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]] && echo true || echo false ))}"
+echo "    Name Regex       : $(show_or_unset "${CLEANUP_OFFLINE_NAME_REGEX:-}")"
+echo "    Dry Run          : ${CLEANUP_OFFLINE_DRY_RUN:-false}"
+echo "    Max Per Sweep    : ${CLEANUP_OFFLINE_MAX:-25}"
+echo "${BANNER_THIN}"
+echo "  Custom init (optional, runs as root before runner)"
+echo "    EXTRA_PACKAGES   : $(show_or_unset "${EXTRA_PACKAGES:-}")"
+echo "    EXTRA_APT_REPOS  : $(mask_secret "${EXTRA_APT_REPOS:-}")"
+echo "    EXTRA_INIT_SCRIPT: $(show_or_unset "${EXTRA_INIT_SCRIPT:-}")"
+echo "${BANNER_THIN}"
+echo "  Authentication (values masked)"
+echo "    Method           : $(auth_method_summary)"
+echo "    RUNNER_TOKEN     : $(mask_secret "${RUNNER_TOKEN:-}")"
+echo "    GITHUB_PAT       : $(mask_secret "${GITHUB_PAT:-}")"
+echo "    GITHUB_TOKEN     : $(mask_secret "${GITHUB_TOKEN:-}")"
+echo "    RUNNER_ENV_FILE  : $(show_or_unset "${RUNNER_ENV_FILE:-}")"
+echo "    RUNNER_SECRETS_DIR: $(show_or_unset "${RUNNER_SECRETS_DIR:-}")"
+echo "${BANNER_LINE}"
+echo ""
+} | prefix_lines banner
+
+sync 2>/dev/null || true
+log "info" "Runner initialization complete -- handing off to s6 to launch svc-gh-runner"
+sync 2>/dev/null || true

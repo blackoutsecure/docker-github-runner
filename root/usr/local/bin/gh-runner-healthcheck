@@ -1,0 +1,46 @@
+#!/bin/bash
+# shellcheck shell=bash
+#
+# Container healthcheck for docker-github-runner.
+#
+# Returns 0 (healthy) when:
+#   - the Runner.Listener process is alive
+#   - the recorded "online" sentinel was updated within HEALTH_STALE_AFTER seconds
+#     (sentinel is written by the heartbeat in svc-gh-runner-logs/run when it
+#      can confirm the runner is online with GitHub, or just when the listener
+#      is alive if we have no API token to consult)
+#
+# Returns 1 (unhealthy) otherwise. Docker / balena / k8s decides what to do.
+#
+# Tunables (env):
+#   HEALTH_STALE_AFTER  seconds before a stale sentinel is considered unhealthy
+#                       (default: 300)
+#
+set -uo pipefail
+
+SENTINEL="/run/gh-runner/online"
+STALE_AFTER="${HEALTH_STALE_AFTER:-300}"
+
+# 1. Listener process must be alive
+if ! pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
+    echo "unhealthy: Runner.Listener process not running"
+    exit 1
+fi
+
+# 2. Sentinel must be fresh (heartbeat refreshes it)
+if [[ ! -f "${SENTINEL}" ]]; then
+    # First few minutes after boot: heartbeat hasn't written yet.
+    # Fall back to "process exists" within the start-period window.
+    exit 0
+fi
+
+now="$(date +%s)"
+mtime="$(stat -c %Y "${SENTINEL}" 2>/dev/null || echo 0)"
+age=$(( now - mtime ))
+
+if (( age > STALE_AFTER )); then
+    echo "unhealthy: online sentinel is stale (${age}s > ${STALE_AFTER}s) -- runner may be disconnected from GitHub"
+    exit 1
+fi
+
+exit 0

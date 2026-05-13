@@ -1,0 +1,240 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Pin our output to PID 1's stdout/stderr (the container's docker-log fds)
+# rather than relying on the s6 service pipe. During shutdown s6 tears down
+# all longruns concurrently, including svc-gh-runner-logs and any logger
+# pipes; lines we write to inherited fds can be cut mid-flight and silently
+# dropped from `docker logs` / `balena logs`. Writing straight to /proc/1/fd/*
+# guarantees the bytes land on the same channel as every other service log
+# and survive teardown ordering. Falls back to the inherited fds if /proc/1
+# isn't writable (e.g. exotic non-Linux test envs).
+if [[ -w /proc/1/fd/1 ]]; then exec 1>>/proc/1/fd/1; fi
+if [[ -w /proc/1/fd/2 ]]; then exec 2>>/proc/1/fd/2; fi
+
+_log_severity() {
+    case "${1,,}" in
+        debug) echo 10 ;;
+        info)  echo 20 ;;
+        warn)  echo 30 ;;
+        error) echo 40 ;;
+        fatal) echo 50 ;;
+        *)     echo 20 ;;
+    esac
+}
+
+log() {
+    local level="$1"; shift
+    local cur min
+    cur=$(_log_severity "${level}")
+    min=$(_log_severity "${LOG_LEVEL:-info}")
+    if [[ "${level,,}" != "fatal" && "${cur}" -lt "${min}" ]]; then
+        return 0
+    fi
+    printf '%s svc-gh-runner[%s]: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${level}" "$*"
+}
+
+EXIT_CODE="$1"
+
+# Emit shutdown notice IMMEDIATELY (before any network/api work) and flush
+# stdout, because some log consumers (notably the balenaCloud dashboard
+# streaming pane) close the stream the moment the container starts to
+# exit; lines printed late in `finish` may never reach the viewer even
+# though Docker still captures them in the underlying log file.
+printf '%s svc-gh-runner[info]: SHUTDOWN signal received -- starting deregistration (exit code: %s)\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${EXIT_CODE}"
+printf '%s svc-gh-runner[info]: If you do not see "Runner deregistered successfully" before the container exits, run `balena logs gh-runner --tail` (or `docker logs gh-runner --tail 50`) after stop -- the dashboard pane often truncates the final lines.\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+sync 2>/dev/null || true
+
+# `finish` runs every time the longrun exits -- whether from a graceful
+# container shutdown (SIGTERM to PID 1 from `docker stop` / balena Stop),
+# from the runner exiting after an ephemeral job, or from a crash. We
+# always attempt to deregister so a stale runner doesn't linger as
+# "offline" in GitHub.
+log "info" "Runner service stopped (exit code: ${EXIT_CODE}) -- running finish hook"
+log "info" "Will attempt to deregister runner from GitHub before container exit"
+
+# ---------------------------------------------------------------------------
+# Deregister the runner from GitHub so it doesn't linger as "offline".
+#
+# Two strategies, in order:
+#   1. API DELETE by runner ID (PREFERRED -- single call, no token-mint
+#      round trip, works even if config.sh's local credentials are stale).
+#      Requires GITHUB_PAT or GITHUB_TOKEN with `admin:org`/`repo`/
+#      `manage_runners:enterprise` as appropriate.
+#   2. config.sh remove with a freshly minted removal token (fallback when
+#      we can't read the runner ID, e.g. .runner file missing).
+#
+# We deliberately do NOT fall back to RUNNER_TOKEN: that's a *registration*
+# token with a 1-hour lifetime and the GitHub API rejects it for the
+# remove endpoint, which is the #1 reason runners linger as offline.
+# ---------------------------------------------------------------------------
+deregister_runner() {
+    cd /opt/runner-bin
+
+    # Skip if there's nothing configured
+    if [[ ! -f ".runner" ]]; then
+        log "info" "No .runner config present -- nothing to deregister"
+        return 0
+    fi
+
+    # Resolve *_FILE secret variants the same way init-gh-runner-config does,
+    # so users who mount the PAT as a docker/k8s secret (e.g. GITHUB_PAT_FILE=
+    # /run/secrets/github_pat) instead of putting it in compose still get a
+    # clean deregister on stop. The init service exports these but exports
+    # don't cross s6 service boundaries, so we re-resolve here.
+    _resolve_file_secret() {
+        local var="$1" file_var="${1}_FILE"
+        local file_path="${!file_var:-}"
+        if [[ -n "${file_path}" && -z "${!var:-}" && -r "${file_path}" ]]; then
+            local v
+            v="$(< "${file_path}")"
+            export "${var}=${v%%$'\n'}"
+        fi
+    }
+    _resolve_file_secret GITHUB_PAT
+    _resolve_file_secret GITHUB_TOKEN
+    _resolve_file_secret RUNNER_URL
+
+    local auth_token="${GITHUB_PAT:-${GITHUB_TOKEN:-}}"
+    local url_path="${RUNNER_URL#https://github.com/}"
+    url_path="${url_path%/}"
+    local api_base="https://api.github.com"
+
+    # Resolve the API scope (enterprise/org/repo) once.
+    local scope_path
+    if [[ "${url_path}" == enterprises/* ]]; then
+        scope_path="enterprises/${url_path#enterprises/}"
+    elif [[ "${url_path}" == */* ]]; then
+        scope_path="repos/${url_path}"
+    else
+        scope_path="orgs/${url_path}"
+    fi
+
+    # ----- Strategy 1: API DELETE by runner ID -----
+    if [[ -n "${auth_token}" ]]; then
+        local runner_id
+        runner_id="$(jq -r '.agentId // empty' .runner 2>/dev/null)"
+        if [[ -n "${runner_id}" ]]; then
+            log "info" "Deregistering runner id=${runner_id} via API DELETE (${scope_path})..."
+            local http_code
+            # api.github.com is consistently sub-second; an 8s cap is
+            # plenty for the happy path and bounds the worst case so we
+            # don't burn finish budget on a hung connection.
+            http_code="$(curl -s -o /tmp/.dereg_resp.$$ -w '%{http_code}' \
+                --max-time 8 -X DELETE \
+                -H "Authorization: token ${auth_token}" \
+                -H "Accept: application/vnd.github+json" \
+                "${api_base}/${scope_path}/actions/runners/${runner_id}" 2>/dev/null || echo 000)"
+            local body
+            body="$(cat /tmp/.dereg_resp.$$ 2>/dev/null || true)"
+            rm -f /tmp/.dereg_resp.$$
+            case "${http_code}" in
+                204)
+                    log "info" "Runner deregistered successfully (API DELETE 204)"
+                    return 0
+                    ;;
+                404)
+                    log "info" "Runner already gone from GitHub (API DELETE 404) -- nothing to do"
+                    return 0
+                    ;;
+                401|403)
+                    log "warn" "API DELETE rejected (HTTP ${http_code}) -- PAT/token lacks scope (need admin:org / repo / manage_runners:enterprise). Body: ${body}"
+                    ;;
+                422)
+                    log "warn" "API DELETE refused (HTTP 422) -- runner is busy with a job. Body: ${body}"
+                    ;;
+                000)
+                    log "warn" "API DELETE network failure (timeout/unreachable) -- will try config.sh fallback"
+                    ;;
+                *)
+                    log "warn" "API DELETE returned HTTP ${http_code} -- will try config.sh fallback. Body: ${body}"
+                    ;;
+            esac
+        else
+            log "warn" "Could not read runner id from .runner -- skipping API DELETE"
+        fi
+    else
+        log "info" "No GITHUB_PAT/GITHUB_TOKEN in env -- skipping API DELETE. The runner will linger in GitHub as 'offline' until reaped (set CLEANUP_OFFLINE_RUNNERS=true and provide a PAT/token on the next start to clean it up automatically, or remove it manually). Tip: set GITHUB_PAT via balena/k8s/docker secret variables -- you don't need to put it in compose; GITHUB_PAT_FILE works too."
+    fi
+
+    # ----- Strategy 2: config.sh remove with a fresh removal token -----
+    local remove_token=""
+    if [[ -n "${auth_token}" ]]; then
+        local resp
+        resp="$(curl -fsSL --max-time 6 -X POST \
+            -H "Authorization: token ${auth_token}" \
+            -H "Accept: application/vnd.github+json" \
+            "${api_base}/${scope_path}/actions/runners/remove-token" 2>&1)" \
+            && remove_token="$(echo "${resp}" | jq -r '.token // empty')"
+        if [[ -z "${remove_token}" ]]; then
+            log "warn" "Failed to mint removal token via API: ${resp}"
+        fi
+    fi
+
+    if [[ -z "${remove_token}" ]]; then
+        log "warn" "No removal token available -- runner will remain visible in GitHub until it's cleaned up (use CLEANUP_OFFLINE_RUNNERS=true on next start, or remove it manually)"
+        return 1
+    fi
+
+    log "info" "Deregistering runner via config.sh remove..."
+    local remove_cmd
+    if [[ "${RUN_AS_NONROOT:-0}" == "1" ]] || [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        remove_cmd=(./config.sh remove --token "${remove_token}")
+    else
+        remove_cmd=(s6-setuidgid abc ./config.sh remove --token "${remove_token}")
+    fi
+    # Hard cap config.sh remove. It makes its own GitHub API calls and
+    # can block indefinitely if the network is unreachable during
+    # shutdown. SIGTERM first, then SIGKILL 3s later if it ignores it.
+    # 12s is enough for a successful round-trip (config.sh remove is
+    # typically 1-3s on a healthy network); a longer cap just burns
+    # finish budget on already-broken networks.
+    if timeout --kill-after=3s 12s "${remove_cmd[@]}" 2>&1 \
+        | awk '{ if ($0 ~ /^[[:space:]]*$/) next;
+                 cmd="date -u +%Y-%m-%dT%H:%M:%SZ"; cmd|getline ts; close(cmd);
+                 printf "%s svc-gh-runner[deregister]: %s\n", ts, $0; fflush() }'; then
+        log "info" "Runner deregistered successfully (config.sh)"
+    else
+        local rc=$?
+        if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+            log "warn" "config.sh remove timed out after 12s (network/GitHub unreachable?) -- runner will appear offline in GitHub until cleanup"
+        else
+            log "warn" "config.sh remove failed (exit ${rc}) -- runner may remain in GitHub"
+        fi
+    fi
+}
+
+# Each blocking step inside deregister_runner has its own hard cap:
+#   * curl API DELETE:        --max-time 8
+#   * curl remove-token call: --max-time 6
+#   * config.sh remove:       timeout --kill-after=3s 12s
+# Worst case: ~26s, well under timeout-finish (30s) and stop_grace_period
+# (30s), so finish can never hang the container on stop. Happy path
+# (single API DELETE 204) completes in <1s.
+deregister_runner
+
+# Final flush + brief grace so the docker log driver actually emits the
+# tail lines (especially the deregister output) before s6 tears the
+# container down. Without this, balena's dashboard streaming pane can
+# truncate the last 5-20 lines even though `balena logs --tail` retains
+# them.
+sync 2>/dev/null || true
+
+if [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]]; then
+    log "info" "Ephemeral mode: shutting down container"
+    sync 2>/dev/null || true
+    # Brief 0.2s grace so docker's log driver actually flushes the
+    # final "shutting down" line before PID 1 exits. A full second
+    # was overkill -- 200ms is enough on every log driver we tested
+    # (json-file, journald, balena's relay).
+    sleep 0.2
+    exec s6-svscanctl -t /run/service
+fi
+
+if [[ "${EXIT_CODE}" != "0" ]]; then
+    log "warn" "Runner exited abnormally (exit code: ${EXIT_CODE}), s6 will restart"
+fi

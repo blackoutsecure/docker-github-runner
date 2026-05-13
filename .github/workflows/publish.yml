@@ -1,0 +1,373 @@
+name: Docker Hub and Balena Publish Workflow
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'build/**'
+      - 'root/**'
+      - '.github/workflows/publish.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker-compose.yml'
+      - 'balena.yml'
+      - 'build/**'
+      - 'root/**'
+      - 'README.md'
+      - '.github/upstream/**'
+      - '.github/workflows/publish.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Also publish to Docker Hub'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: docker.io
+  BASE_IMAGE_REGISTRY: ghcr.io
+  DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_NAMESPACE }}
+  IMAGE_NAME: github-runner
+  REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+  DOCKERFILE_PATH: ./Dockerfile
+  UPSTREAM_TRACK_FILE: .github/upstream/actions-runner.json
+  BALENA_NAMESPACE: ${{ vars.BALENA_NAMESPACE || secrets.BALENA_USERNAME }}
+  BALENA_BLOCK_RELEASE: github-runner
+
+jobs:
+  # ── Stage 1: Preflight ─────────────────────────────────────────────
+  # Lint, validate secrets, and resolve runner version once for all jobs.
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_publish: ${{ steps.context.outputs.should_publish }}
+      version: ${{ steps.upstream.outputs.version }}
+      vcs_ref: ${{ steps.upstream.outputs.vcs_ref }}
+      build_date: ${{ steps.upstream.outputs.build_date }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine publish context
+        id: context
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.publish }}" == "true" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate Dockerfile syntax
+        run: docker run --rm -i hadolint/hadolint:latest hadolint - < "${DOCKERFILE_PATH}" || true
+
+      - name: Validate required secrets and namespace
+        if: steps.context.outputs.should_publish == 'true'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
+        run: |
+          set -euo pipefail
+
+          for var in DOCKERHUB_USERNAME DOCKERHUB_TOKEN DOCKERHUB_NAMESPACE; do
+            if [ -z "${!var}" ]; then
+              echo "${var} is not set"
+              exit 1
+            fi
+          done
+
+          if [[ "${DOCKERHUB_USERNAME}" =~ [[:space:]] ]]; then
+            echo "DOCKERHUB_USERNAME must not contain spaces"
+            exit 1
+          fi
+
+          if ! [[ "${DOCKERHUB_NAMESPACE}" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+            echo "DOCKERHUB_NAMESPACE has invalid format. Use lowercase Docker Hub namespace slug only."
+            exit 1
+          fi
+
+          echo "Docker Hub credentials validated"
+
+      - name: Resolve runner version
+        id: upstream
+        run: |
+          set -euo pipefail
+
+          # Prefer the tracked upstream version (kept current by upstream-release-monitor),
+          # fall back to the Dockerfile ARG default for local/manual runs.
+          if [ -f "${UPSTREAM_TRACK_FILE}" ]; then
+            VERSION="$(jq -r '.version // empty' "${UPSTREAM_TRACK_FILE}")"
+            VCS_REF="$(jq -r '.commit // empty' "${UPSTREAM_TRACK_FILE}")"
+          fi
+
+          if [ -z "${VERSION:-}" ]; then
+            VERSION="$(grep -E '^ARG APP_VERSION=' "${DOCKERFILE_PATH}" | head -n1 | cut -d= -f2)"
+          fi
+
+          if [ -z "${VERSION:-}" ]; then
+            echo "ERROR: Could not resolve runner version"
+            exit 1
+          fi
+
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          {
+            echo "version=${VERSION}"
+            echo "vcs_ref=${VCS_REF:-${GITHUB_SHA}}"
+            echo "build_date=${BUILD_DATE}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved runner version: ${VERSION} (ref: ${VCS_REF:-${GITHUB_SHA}})"
+
+  # ── Stage 2: Build ─────────────────────────────────────────────────
+  # Matrix build per arch. Publishes digests on main.
+  docker:
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: [self-hosted, Linux, ARM64, ubuntu-latest]
+            platform: linux/arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Docker Hub login
+        if: needs.preflight.outputs.should_publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build only (PR/check mode)
+        if: needs.preflight.outputs.should_publish != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: false
+          platforms: ${{ matrix.platform }}
+          pull: true
+          provenance: false
+          build-args: |
+            BASE_IMAGE_REGISTRY=${{ env.BASE_IMAGE_REGISTRY }}
+            APP_VERSION=${{ needs.preflight.outputs.version }}
+            VCS_URL=${{ env.REPO_URL }}
+          labels: |
+            org.opencontainers.image.created=${{ needs.preflight.outputs.build_date }}
+            org.opencontainers.image.version=check-${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.preflight.outputs.vcs_ref }}
+            org.opencontainers.image.source=${{ env.REPO_URL }}
+            org.opencontainers.image.url=${{ env.REPO_URL }}
+
+      - name: Build and publish by digest
+        if: needs.preflight.outputs.should_publish == 'true'
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE_PATH }}
+          platforms: ${{ matrix.platform }}
+          pull: true
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            BASE_IMAGE_REGISTRY=${{ env.BASE_IMAGE_REGISTRY }}
+            APP_VERSION=${{ needs.preflight.outputs.version }}
+            VCS_URL=${{ env.REPO_URL }}
+          labels: |
+            org.opencontainers.image.created=${{ needs.preflight.outputs.build_date }}
+            org.opencontainers.image.version=${{ needs.preflight.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.preflight.outputs.vcs_ref }}
+            org.opencontainers.image.source=${{ env.REPO_URL }}
+            org.opencontainers.image.url=${{ env.REPO_URL }}
+
+      - name: Export and upload digest
+        if: needs.preflight.outputs.should_publish == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest artifact
+        if: needs.preflight.outputs.should_publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Stage 3: Manifest ──────────────────────────────────────────────
+  # Assemble multi-arch manifests and tag on Docker Hub.
+  manifest:
+    needs: [preflight, docker]
+    if: needs.preflight.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Create and push multi-arch manifests
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          SHORT_VCS_REF: ${{ needs.preflight.outputs.vcs_ref }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          SHORT_VCS_REF="${SHORT_VCS_REF:0:12}"
+          SHORT_SHA="${SHORT_SHA::12}"
+
+          mapfile -t DIGESTS < <(find /tmp/digests -type f -printf '%f\n' | sort)
+
+          if [ "${#DIGESTS[@]}" -eq 0 ]; then
+            echo "No digests found to assemble multi-arch manifest"
+            exit 1
+          fi
+
+          SOURCES=()
+          for digest in "${DIGESTS[@]}"; do
+            SOURCES+=("${IMAGE_REF}@sha256:${digest}")
+          done
+
+          for attempt in 1 2 3; do
+            if docker buildx imagetools create \
+              --tag "${IMAGE_REF}:latest" \
+              --tag "${IMAGE_REF}:${VERSION}" \
+              --tag "${IMAGE_REF}:${VERSION}-${SHORT_VCS_REF}" \
+              --tag "${IMAGE_REF}:sha-${SHORT_SHA}" \
+              "${SOURCES[@]}"; then
+              echo "Multi-arch manifest created successfully"
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "ERROR: Failed to create manifest after 3 attempts"
+              exit 1
+            fi
+            echo "Attempt ${attempt}/3 failed, retrying in 15s..."
+            sleep 15
+          done
+
+          docker buildx imagetools inspect "${IMAGE_REF}:latest"
+          docker buildx imagetools inspect "${IMAGE_REF}:${VERSION}"
+
+  # ── Stage 4a: Update Docker Hub description ────────────────────────
+  update-description:
+    needs: manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update Docker Hub Description
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          short-description: ${{ github.event.repository.description }}
+          enable-url-completion: true
+
+  # ── Stage 4b: Publish Balena block (parallel with 4a) ──────────────
+  balena-block-publish:
+    needs: [preflight, manifest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update balena.yml with resolved version
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.preflight.outputs.version }}"
+          echo "Updating balena.yml version to: ${VERSION}"
+          sed -i -E "s/^version: .*/version: ${VERSION}/" balena.yml
+          grep "^version:" balena.yml
+
+      - name: Persist balena.yml version
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.preflight.outputs.version }}"
+
+          if git diff --quiet -- balena.yml; then
+            echo "balena.yml already matches ${VERSION}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add balena.yml
+          git commit -m "chore: sync balena block version to ${VERSION}"
+          git push
+
+      - name: Resolve Balena publish target
+        id: targets
+        run: |
+          set -euo pipefail
+          BLOCK_FLEET="${BALENA_NAMESPACE}/${BALENA_BLOCK_RELEASE}"
+          echo "block_fleet=${BLOCK_FLEET}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Balena block release
+        uses: balena-io/deploy-to-balena-action@master
+        with:
+          balena_token: ${{ secrets.BALENA_API_TOKEN }}
+          fleet: ${{ steps.targets.outputs.block_fleet }}
+          cache: false
+          layer_cache: false
+          debug: false
+          source: .
+
+      - name: Log deployment info
+        run: |
+          echo "Published block release slug: ${{ steps.targets.outputs.block_fleet }}"
+          echo "Balena version: ${{ needs.preflight.outputs.version }}"

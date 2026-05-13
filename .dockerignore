@@ -1,0 +1,53 @@
+# VCS
+.git
+.github/
+.gitignore
+.gitattributes
+
+# Environment and secrets
+.env
+.env.*
+
+# GitHub Actions runner registration / credential artifacts.
+# These are runtime-only files (written by config.sh inside the container).
+# Excluding them belt-and-suspenders ensures that even if someone tests the
+# runner locally and leaves these in the repo dir, they NEVER end up baked
+# into the image build context.
+.runner
+.credentials
+.credentials_rsaparams
+.path
+runner-secrets/
+*_token.txt
+*.pat
+*.gh-token
+
+# Private key / cert formats
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ecdsa
+id_ed25519
+
+# Documentation and metadata (not needed in image)
+README.md
+LICENSE
+readme-vars.yml
+logo.png
+
+# Editor and tooling config
+.editorconfig
+.vscode/
+.idea/
+
+# Local development
+tmp/
+*.log
+*.tmp
+
+# Ensure root overlay, build scripts, and Dockerfile context are included
+!root/
+!build/
+!Dockerfile

@@ -1,0 +1,44 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+set -uo pipefail
+
+cd /opt/runner-bin
+
+# Emit and flush before any pipeline setup so the operator can see the
+# longrun has actually been started by s6 (otherwise a kill in the next
+# few ms would leave init looking like the last thing that ran).
+echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-gh-runner[info]: longrun entered -- preparing Runner.Listener"
+sync 2>/dev/null || true
+echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-gh-runner[info]: Starting runner (${RUNNER_NAME:-$(hostname)}, ephemeral=${RUNNER_EPHEMERAL:-false})"
+echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-gh-runner[info]: Handing off to Runner.Listener -- connecting to GitHub Actions and waiting for jobs..."
+
+# We pipe Runner.Listener output through awk so every line on the console
+# is prefixed with `<ts> svc-gh-runner[runner]:`. CRITICAL: we must use
+# `exec ... > >(awk ...) 2>&1` (process substitution) and NOT a regular
+# pipeline. With a regular pipeline (`runner | awk`) bash stays as the
+# parent process, the s6 supervisor sends SIGTERM to bash on container
+# stop, bash does NOT forward it to its children, and Runner.Listener is
+# orphaned -- which means the `finish` script runs before the runner has
+# actually exited cleanly and `config.sh remove` may race or fail. With
+# `exec` + process substitution, Runner.Listener REPLACES bash and
+# becomes the directly supervised process, so SIGTERM hits it and it
+# performs a clean shutdown before `finish` deregisters.
+exec > >(awk '
+    {
+        if ($0 ~ /^[[:space:]]*$/) next
+        cmd = "date -u +%Y-%m-%dT%H:%M:%SZ"
+        cmd | getline ts
+        close(cmd)
+        printf "%s svc-gh-runner[runner]: %s\n", ts, $0
+        fflush()
+    }
+') 2>&1
+
+# When running with `--user <uid>:<gid>` (LSIO non-root mode) we are already
+# the unprivileged user -- no s6-setuidgid drop is needed (it would fail
+# without root). Otherwise drop privileges to the LSIO abc user.
+if [[ "${RUN_AS_NONROOT:-0}" == "1" ]] || [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec ./bin/Runner.Listener run --startuptype service
+else
+    exec s6-setuidgid abc ./bin/Runner.Listener run --startuptype service
+fi
