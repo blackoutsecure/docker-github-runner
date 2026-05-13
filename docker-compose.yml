@@ -2,7 +2,7 @@ version: '2.4'
 
 services:
   gh-runner:
-    image: docker.io/blackoutsecure/docker-github-runner:latest
+    image: docker.io/blackoutsecure/github-runner:latest
     container_name: gh-runner
     environment:
       TZ: Etc/UTC
