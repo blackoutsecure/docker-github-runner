@@ -50,8 +50,6 @@ env:
   BALENA_BLOCK_RELEASE: github-runner
 
 jobs:
-  # ── Stage 1: Preflight ─────────────────────────────────────────────
-  # Lint, validate secrets, and resolve runner version once for all jobs.
   preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -138,8 +136,8 @@ jobs:
 
           echo "Resolved runner version: ${VERSION} (ref: ${VCS_REF:-${GITHUB_SHA}})"
 
-  # ── Stage 2: Build ─────────────────────────────────────────────────
-  # Matrix build per arch. Publishes digests on main.
+  # arm64 builds run on the org's `ubuntu-latest-arm64` larger-runner label
+  # (native ARM64; avoids QEMU emulation).
   docker:
     needs: preflight
     runs-on: ${{ matrix.runner }}
@@ -152,7 +150,7 @@ jobs:
             runner: ubuntu-latest
             platform: linux/amd64
           - arch: arm64
-            runner: [ubuntu-latest-arm64]
+            runner: ubuntu-latest-arm64
             platform: linux/arm64
 
     steps:
@@ -229,8 +227,6 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── Stage 3: Manifest ──────────────────────────────────────────────
-  # Assemble multi-arch manifests and tag on Docker Hub.
   manifest:
     needs: [preflight, docker]
     if: needs.preflight.outputs.should_publish == 'true'
@@ -297,7 +293,7 @@ jobs:
           docker buildx imagetools inspect "${IMAGE_REF}:latest"
           docker buildx imagetools inspect "${IMAGE_REF}:${VERSION}"
 
-  # ── Stage 4a: Update Docker Hub description ────────────────────────
+
   update-description:
     needs: manifest
     runs-on: ubuntu-latest
@@ -315,7 +311,6 @@ jobs:
           short-description: ${{ github.event.repository.description }}
           enable-url-completion: true
 
-  # ── Stage 4b: Publish Balena block (parallel with 4a) ──────────────
   balena-block-publish:
     needs: [preflight, manifest]
     runs-on: ubuntu-latest

@@ -51,7 +51,6 @@ jobs:
             echo "ℹ Manual dispatch: resolving version from upstream ${UPSTREAM_REPO}"
 
             UPSTREAM_VERSION=""
-            # Prefer the tracked upstream JSON if present
             if [ -f "${UPSTREAM_TRACK_FILE}" ]; then
               UPSTREAM_VERSION="$(jq -r '.version // empty' "${UPSTREAM_TRACK_FILE}")"
             fi
@@ -119,7 +118,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "ℹ Release Version: ${VERSION}"
 
-          # Read upstream metadata from tracked file if present
           UPSTREAM_VERSION=""
           UPSTREAM_COMMIT=""
           if [ -f "${UPSTREAM_TRACK_FILE}" ]; then
@@ -145,6 +143,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "ℹ Upstream actions/runner: ${UPSTREAM_VERSION} (${UPSTREAM_COMMIT_SHORT})"
 
+  # arm64 builds run on the org's `ubuntu-latest-arm64` larger-runner label
+  # (native ARM64; avoids QEMU emulation).
   build-images:
     needs: [validate-release, release-metadata]
     runs-on: ${{ matrix.runner }}
@@ -157,7 +157,7 @@ jobs:
             runner: ubuntu-latest
             platform: linux/amd64
           - arch: arm64
-            runner: [ubuntu-latest-arm64]
+            runner: ubuntu-latest-arm64
             platform: linux/arm64
     steps:
       - name: Checkout
