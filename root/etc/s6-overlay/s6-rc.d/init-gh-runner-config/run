@@ -355,6 +355,37 @@ resolve_secret GITHUB_PAT
 resolve_secret GITHUB_TOKEN
 stage_end
 
+# ---------------------------------------------------------------------------
+# Print scope-specific token-permission guidance. GitHub's three runner
+# registration tiers (enterprise/org/repo) each accept a different mix of
+# token kinds and scopes, and conflating them in one generic hint (as the
+# previous implementation did) actively misleads operators -- e.g. it told
+# enterprise users they could fix a 401 by adding the 'repo' scope, which
+# does nothing at the enterprise tier.
+# ---------------------------------------------------------------------------
+_print_required_scope() {
+    local kind="$1"
+    log "fatal" "  Required token permissions for ${kind}-level runner registration:"
+    case "${kind}" in
+        enterprise)
+            log "fatal" "    - Classic PAT: 'manage_runners:enterprise' scope (REQUIRED -- 'repo' and 'admin:org' do NOT work)"
+            log "fatal" "    - Fine-grained PAT: NOT SUPPORTED for enterprise runners"
+            log "fatal" "    - GITHUB_TOKEN (Actions): NOT SUPPORTED for enterprise runners"
+            log "fatal" "    - The PAT owner must be an enterprise owner."
+            ;;
+        org)
+            log "fatal" "    - Classic PAT: 'admin:org' scope"
+            log "fatal" "    - Fine-grained PAT: org 'Self-hosted runners' permission (read & write), token issued by an org owner"
+            log "fatal" "    - GITHUB_TOKEN (Actions): NOT SUPPORTED for org runners"
+            ;;
+        repo)
+            log "fatal" "    - Classic PAT: 'repo' scope"
+            log "fatal" "    - Fine-grained PAT: repo 'Administration' permission (read & write)"
+            log "fatal" "    - GITHUB_TOKEN (Actions): permissions: { actions: write } in the workflow"
+            ;;
+    esac
+}
+
 generate_registration_token() {
     local auth_token="$1"
     local token_source="$2"
@@ -368,68 +399,169 @@ generate_registration_token() {
     url_path="${url_path%/}"  # strip trailing slash
 
     local api_base="https://api.github.com"
-    local token_url scope_desc
+    local token_url scope_desc scope_kind
 
     if [[ "${url_path}" == enterprises/* ]]; then
         local ent_name="${url_path#enterprises/}"
         token_url="${api_base}/enterprises/${ent_name}/actions/runners/registration-token"
         scope_desc="enterprise/${ent_name}"
+        scope_kind="enterprise"
     elif [[ "${url_path}" == */* ]]; then
         token_url="${api_base}/repos/${url_path}/actions/runners/registration-token"
         scope_desc="repo/${url_path}"
+        scope_kind="repo"
     else
         token_url="${api_base}/orgs/${url_path}/actions/runners/registration-token"
         scope_desc="org/${url_path}"
+        scope_kind="org"
     fi
 
-    log "info" "Generating registration token via GitHub API (${scope_desc}) using ${token_source}"
+    # Best-effort token-kind detection from the documented prefix. Only
+    # the prefix is inspected; the secret value is never logged. Helps
+    # us flag obviously-incompatible combinations (e.g. fine-grained PAT
+    # against an enterprise URL) before round-tripping to GitHub.
+    local token_kind="unknown"
+    case "${auth_token}" in
+        ghp_*)        token_kind="classic-pat" ;;
+        github_pat_*) token_kind="fine-grained-pat" ;;
+        ghs_*)        token_kind="github-app-installation" ;;
+        gho_*)        token_kind="oauth" ;;
+        ghu_*)        token_kind="github-app-user-to-server" ;;
+        ghr_*)        token_kind="github-app-refresh" ;;
+    esac
 
-    local http_response
-    http_response="$(curl -fsSL -w "\n%{http_code}" -X POST \
+    log "info" "Generating registration token via GitHub API (${scope_desc}) using ${token_source} [token-kind=${token_kind}]"
+
+    # Pre-flight: warn about combinations GitHub does not support so the
+    # operator gets a clear hint even before the API rejects the call.
+    if [[ "${scope_kind}" == "enterprise" ]]; then
+        case "${token_kind}" in
+            fine-grained-pat)
+                log "warn" "Enterprise-level runner registration is NOT supported with fine-grained PATs"
+                log "warn" "Use a Classic PAT with the 'manage_runners:enterprise' scope instead"
+                ;;
+            github-app-installation|oauth|github-app-user-to-server|github-app-refresh)
+                log "warn" "Enterprise-level runner registration requires a Classic PAT with 'manage_runners:enterprise'"
+                log "warn" "Detected token kind '${token_kind}' is unlikely to be accepted at the enterprise tier"
+                ;;
+        esac
+    fi
+
+    # We deliberately do NOT use `curl -f` here. -f swallows the response
+    # body and collapses every HTTP error into "curl: (22) ... error: NNN",
+    # which made it impossible to distinguish 401 (bad token) from 403
+    # (missing scope) from 404 (wrong URL) -- the very distinctions an
+    # operator needs to fix the problem. Capture body + status separately
+    # and dispatch on the code ourselves.
+    local tmp_body curl_stderr
+    tmp_body="$(mktemp)"
+    curl_stderr="$(mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f '${tmp_body}' '${curl_stderr}'" RETURN
+
+    local http_code curl_exit=0
+    http_code="$(curl -sS -X POST \
         -H "Authorization: token ${auth_token}" \
         -H "Accept: application/vnd.github+json" \
-        "${token_url}" 2>&1)" || {
-        log "fatal" "Failed to request registration token from GitHub API"
-        log "fatal" "URL: ${token_url}"
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        -o "${tmp_body}" \
+        -w '%{http_code}' \
+        "${token_url}" 2>"${curl_stderr}")" || curl_exit=$?
+
+    if [[ "${curl_exit}" -ne 0 ]]; then
+        log "fatal" "curl failed to reach the GitHub API (exit ${curl_exit})"
+        log "fatal" "URL:    ${token_url}"
         log "fatal" "Source: ${token_source}"
-        log "fatal" "Response: ${http_response}"
-        log "fatal" "Ensure the token has the required permissions:"
-        log "fatal" "  - Classic PAT: 'repo' scope (repo-level) or 'admin:org' scope (org-level)"
-        log "fatal" "  - Fine-grained PAT: 'Administration' permission (read & write)"
-        log "fatal" "  - GITHUB_TOKEN (Actions): must have 'actions' write permission"
+        local stderr_detail
+        stderr_detail="$(cat "${curl_stderr}" 2>/dev/null || true)"
+        if [[ -n "${stderr_detail}" ]]; then
+            log "fatal" "Detail: ${stderr_detail}"
+        fi
+        log "fatal" "Likely causes: DNS resolution failure, blocked egress to api.github.com, TLS interception/MITM proxy, or HTTP_PROXY/HTTPS_PROXY misconfiguration"
+        rm -f "${tmp_body}" "${curl_stderr}"
         exit 1
-    }
+    fi
 
-    local http_body http_code
-    http_body="$(echo "${http_response}" | head -n -1)"
-    http_code="$(echo "${http_response}" | tail -n 1)"
+    if [[ "${http_code}" == "201" ]]; then
+        local http_body
+        http_body="$(cat "${tmp_body}")"
+        RUNNER_TOKEN="$(echo "${http_body}" | jq -r '.token // empty')"
+        if [[ -z "${RUNNER_TOKEN}" ]]; then
+            log "fatal" "GitHub API returned 201 but the response did not contain a token"
+            log "fatal" "Response: ${http_body}"
+            rm -f "${tmp_body}" "${curl_stderr}"
+            exit 1
+        fi
+        export RUNNER_TOKEN
+        local expires_at expires_utc
+        expires_at="$(echo "${http_body}" | jq -r '.expires_at // "unknown"')"
+        # Normalize to UTC. The GitHub API returns the timestamp in the
+        # account's local TZ (e.g. "2026-04-20T08:46:30.714-04:00");
+        # converting to UTC keeps every log line in the same time zone.
+        if [[ "${expires_at}" != "unknown" ]]; then
+            expires_utc="$(date -u -d "${expires_at}" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${expires_at}")"
+        else
+            expires_utc="unknown"
+        fi
+        log "info" "Registration token generated successfully (expires: ${expires_utc})"
+        return 0
+    fi
 
-    if [[ "${http_code}" != "201" ]]; then
-        log "fatal" "GitHub API returned HTTP ${http_code} when generating registration token"
-        log "fatal" "Source: ${token_source}"
+    # ----- Non-201: build a focused, scope-aware diagnostic --------------
+    local http_body gh_message
+    http_body="$(cat "${tmp_body}" 2>/dev/null || true)"
+    gh_message="$(echo "${http_body}" | jq -r '.message // empty' 2>/dev/null || true)"
+
+    log "fatal" "GitHub API returned HTTP ${http_code} when generating registration token"
+    log "fatal" "URL:    ${token_url}"
+    log "fatal" "Scope:  ${scope_desc}"
+    log "fatal" "Source: ${token_source} (token-kind=${token_kind})"
+    if [[ -n "${gh_message}" ]]; then
+        log "fatal" "GitHub: ${gh_message}"
+    elif [[ -n "${http_body}" ]]; then
         log "fatal" "Response: ${http_body}"
-        exit 1
     fi
 
-    RUNNER_TOKEN="$(echo "${http_body}" | jq -r '.token // empty')"
-    if [[ -z "${RUNNER_TOKEN}" ]]; then
-        log "fatal" "GitHub API response did not contain a token"
-        log "fatal" "Response: ${http_body}"
-        exit 1
-    fi
+    case "${http_code}" in
+        401)
+            log "fatal" "401 Unauthorized -- the token itself was rejected by GitHub (the credential is invalid)."
+            log "fatal" "  Most common causes, in order of likelihood:"
+            log "fatal" "    1. The PAT has expired or been revoked. Generate a new one and update ${token_source}."
+            log "fatal" "    2. The token value is malformed: stray whitespace, wrong env var, or an empty file mounted via ${token_source}_FILE."
+            log "fatal" "    3. SAML SSO session lapsed for this PAT. Re-authorize it under PAT settings -> 'Configure SSO'."
+            log "fatal" "  Quick check (run from any host with the same token):"
+            log "fatal" "    curl -i -H \"Authorization: token <PAT>\" https://api.github.com/user"
+            log "fatal" "    -- HTTP 200 means the credential is alive; HTTP 401 confirms it is dead."
+            ;;
+        403)
+            log "fatal" "403 Forbidden -- the token authenticated, but it is not allowed to perform this action."
+            log "fatal" "  Likely causes: missing scope, SSO not authorized for this enterprise/org, IP allow list, or a secondary rate / abuse limit."
+            _print_required_scope "${scope_kind}"
+            ;;
+        404)
+            log "fatal" "404 Not Found -- either RUNNER_URL is wrong, or the token cannot see the target."
+            log "fatal" "  Verify RUNNER_URL=${RUNNER_URL} matches an existing ${scope_kind}."
+            if [[ "${scope_kind}" == "enterprise" ]]; then
+                log "fatal" "  Note: GitHub returns 404 (not 403) when a token lacks visibility into an enterprise."
+                log "fatal" "  This usually means the PAT is missing the 'manage_runners:enterprise' scope, or the user is not an enterprise owner."
+                _print_required_scope "${scope_kind}"
+            fi
+            ;;
+        422)
+            log "fatal" "422 Unprocessable Entity -- GitHub rejected the request payload or scope target."
+            log "fatal" "  Check that ${scope_desc} is a valid Actions runner registration target (Actions enabled, runner groups configured, etc.)."
+            ;;
+        429|5*)
+            log "fatal" "GitHub API is rate-limited or unhealthy (HTTP ${http_code}). Retry after a short delay; check https://www.githubstatus.com/."
+            ;;
+        *)
+            log "fatal" "Unexpected status. Treating as a permission/configuration error."
+            _print_required_scope "${scope_kind}"
+            ;;
+    esac
 
-    export RUNNER_TOKEN
-    local expires_at expires_utc
-    expires_at="$(echo "${http_body}" | jq -r '.expires_at // "unknown"')"
-    # Normalize to UTC. The GitHub API returns the timestamp in the
-    # account's local TZ (e.g. "2026-04-20T08:46:30.714-04:00"); converting
-    # to UTC keeps every log line in the same time zone.
-    if [[ "${expires_at}" != "unknown" ]]; then
-        expires_utc="$(date -u -d "${expires_at}" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${expires_at}")"
-    else
-        expires_utc="unknown"
-    fi
-    log "info" "Registration token generated successfully (expires: ${expires_utc})"
+    rm -f "${tmp_body}" "${curl_stderr}"
+    exit 1
 }
 
 if [[ -z "${RUNNER_TOKEN:-}" ]]; then
