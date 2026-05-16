@@ -1,19 +1,50 @@
 version: '2.4'
 
+networks:
+  gh-runner-isolated:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+
 services:
   gh-runner:
     image: docker.io/blackoutsecure/github-runner:latest
     container_name: gh-runner
+    networks:
+      - gh-runner-isolated
     environment:
       TZ: Etc/UTC
       RUNNER_EPHEMERAL: "true"
       DOCKER_IN_DOCKER: "true"
       AUTO_DOCKER_LABEL: "false"
       CLEANUP_OFFLINE_RUNNERS: "true"
+      CLEANUP_OFFLINE_IMMEDIATE: "true"
+      CLEANUP_OFFLINE_NAME_REGEX: "^gh-runner"
+      CLEANUP_OFFLINE_MAX: "25"
+      CLEANUP_OFFLINE_DRY_RUN: "false"
+      DISABLE_RUNNER_UPDATE: "true"
+      LOG_LEVEL: "info"
+      HEARTBEAT_INTERVAL: "120"
+      JOB_HEARTBEAT_INTERVAL: "120"
+      HEALTH_STALE_AFTER: "300"
+      ON_OFFLINE_ACTION: "restart"
+      ONLINE_PROBE_EVERY: "1"
+      ONLINE_FAIL_THRESHOLD: "3"
+
     labels:
       io.balena.features.supervisor-api: '1'
       io.balena.features.balena-api: '1'
       io.balena.features.balena-socket: '1'
+
+    ipc: "private"
+    uts_mode: "host"
+    dns_search: []
+
     security_opt:
       - no-new-privileges=true
     cap_drop:
@@ -26,8 +57,9 @@ services:
       - FOWNER
     tmpfs:
       - /run:exec,size=64m
-      - /tmp:exec,size=2g
+      - /tmp:exec,size=2g,mode=1777
       - /var/log:size=32m
+      - /config:size=128m,mode=1777
     stop_grace_period: 30s
     shm_size: 1gb
-    restart: unless-stopped
+    restart: always

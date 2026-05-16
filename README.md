@@ -648,10 +648,25 @@ LSIO non-root mode (`user: "911:911"`) is supported on a best-effort basis — s
 
 ### Ephemeral mode and the concurrency model
 
+#### ⚠️ IMPORTANT: Ephemeral Mode Does NOT Restart the Entire Box
+
+**Ephemeral only restarts the individual CONTAINER (runner), not the entire Balena device or box.**
+
+- When a job finishes, that ONE runner **container** exits.
+- Docker automatically restarts ONLY THAT container (via `restart: always`).
+- **The entire device/box stays up and running** — no box restart, no shutdown.
+- All other containers and services continue running normally.
+- Only that specific runner container is recreated for the next job.
+
+**This is crucial:** Ephemeral is safe for multi-container environments. It does NOT disrupt other services or jobs.
+
+---
+
 `RUNNER_EPHEMERAL=true` makes the upstream `Runner.Listener` single-shot: each container picks up exactly **one job**, runs it, and exits. With `restart: always` the container is then re-created and registers as a brand-new runner. There is **no upstream knob for "N jobs per listener"** in ephemeral mode — this is how `--ephemeral` is defined by GitHub.
 
 > **One ephemeral container = capacity for one concurrent job.**
 > Concurrency on a host comes from running **multiple replicas**, not from anything inside a single container.
+> **Each replica is independent — one replica exiting does NOT affect other replicas or the host.**
 
 If you need *N* jobs to run at the same time:
 
