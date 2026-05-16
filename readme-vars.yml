@@ -38,7 +38,7 @@ opt_param_env_vars:
   - {env_var: "RUNNER_WORKDIR", env_value: "/config/work", desc: "Working directory for runner jobs"}
   - {env_var: "RUNNER_EPHEMERAL", env_value: "false", desc: "Run in ephemeral mode — runner exits after one job (for autoscaling)"}
   - {env_var: "RUNNER_REPLACE_EXISTING", env_value: "true", desc: "Replace any existing runner with the same name"}
-  - {env_var: "DISABLE_RUNNER_UPDATE", env_value: "false", desc: "Disable automatic runner updates (recommended with read_only: true)"}
+  - {env_var: "DISABLE_RUNNER_UPDATE", env_value: "false", desc: "Disable automatic upstream runner auto-updates (useful when you pin a runner version via the image tag)"}
   - {env_var: "RUNNER_TOKEN_FILE", env_value: "", desc: "Path to file containing RUNNER_TOKEN (Docker secrets / Kubernetes projected volumes)"}
   - {env_var: "RUNNER_URL_FILE", env_value: "", desc: "Path to file containing RUNNER_URL"}
   - {env_var: "GITHUB_PAT_FILE", env_value: "", desc: "Path to file containing GITHUB_PAT"}
@@ -49,7 +49,12 @@ opt_param_env_vars:
   - {env_var: "EXTRA_APT_REPOS", env_value: "", desc: "Semicolon-separated apt sources lines added before installing EXTRA_PACKAGES"}
   - {env_var: "EXTRA_INIT_SCRIPT", env_value: "", desc: "Path inside container to a shell script (typically bind-mounted) run as root before the runner starts"}
   - {env_var: "DOCKER_IN_DOCKER", env_value: "false", desc: "Enable container-based jobs: binds the runner user to the gid of the mounted /var/run/docker.sock and auto-appends a `docker` runner label. Requires bind-mounting /var/run/docker.sock. Default false because it grants the runner significant host privileges."}
-  - {env_var: "ONLINE_PROBE_EVERY", env_value: "1", desc: "Verify runner is online with GitHub every N heartbeats (~2 min each); 0 disables (requires GITHUB_PAT or GITHUB_TOKEN)"}
+  - {env_var: "AUTO_DOCKER_LABEL", env_value: "", desc: "When 'true' auto-append a `docker` label to RUNNER_LABELS so workflows can target `runs-on: [self-hosted, docker]`. Empty = follow DOCKER_IN_DOCKER."}
+  - {env_var: "DOCKER_HOST_SOCK", env_value: "", desc: "Override the in-container Docker socket path; empty = auto-detect /var/run/docker.sock then /var/run/balena-engine.sock."}
+  - {env_var: "HEARTBEAT_INTERVAL", env_value: "120", desc: "Seconds between heavyweight HEALTH HEARTBEAT log banners. Minimum 30."}
+  - {env_var: "JOB_HEARTBEAT_INTERVAL", env_value: "120", desc: "Seconds between mid-job JOB HEARTBEAT log banners (only while a job is running). 0 disables; minimum 30 when enabled."}
+  - {env_var: "FORCE_RUNNER_PERMISSIONS_FIX", env_value: "false", desc: "Force a defensive `chown -R abc:abc /opt/runner-bin` at startup, bypassing the build-time ownership marker. Useful after a manual chown changed file ownership."}
+  - {env_var: "ONLINE_PROBE_EVERY", env_value: "1", desc: "Verify runner is online with GitHub every N heartbeats; 0 disables (requires GITHUB_PAT or GITHUB_TOKEN)"}
   - {env_var: "ONLINE_FAIL_THRESHOLD", env_value: "3", desc: "Consecutive offline detections before triggering ON_OFFLINE_ACTION"}
   - {env_var: "ON_OFFLINE_ACTION", env_value: "restart", desc: "Action when offline threshold trips: none | restart (s6-svc -r) | shutdown (container exit)"}
   - {env_var: "HEALTH_STALE_AFTER", env_value: "300", desc: "Seconds before the Docker HEALTHCHECK reports unhealthy if the online sentinel goes stale"}
@@ -61,8 +66,8 @@ opt_param_env_vars:
   - {env_var: "CLEANUP_OFFLINE_MAX", env_value: "25", desc: "Maximum number of runners (count, not a duration) removed per startup sweep. Safety brake against an accidental mass-delete."}
   - {env_var: "S6_SERVICES_GRACETIME", env_value: "30000", desc: "s6 service shutdown gracetime (ms) — must allow time for the runner to deregister from GitHub"}
   - {env_var: "S6_KILL_GRACETIME", env_value: "30000", desc: "s6 hard-kill gracetime (ms) — keep aligned with stop_grace_period in compose"}
-  - {env_var: "PUID", env_value: "1000", desc: "User ID for file ownership (LinuxServer.io base image standard; ignored when read_only: true)"}
-  - {env_var: "PGID", env_value: "1000", desc: "Group ID for file ownership (LinuxServer.io base image standard; ignored when read_only: true)"}
+  - {env_var: "PUID", env_value: "1000", desc: "User ID for file ownership (LinuxServer.io base image standard; ignored in LSIO non-root mode)"}
+  - {env_var: "PGID", env_value: "1000", desc: "Group ID for file ownership (LinuxServer.io base image standard; ignored in LSIO non-root mode)"}
 
 # optional parameters
 optional_parameters: |
@@ -82,12 +87,17 @@ app_setup_block: |
   - Organization: Settings > Actions > Runners > New runner
   - API: `curl -X POST -H "Authorization: token GITHUB_PAT" https://api.github.com/repos/OWNER/REPO/actions/runners/registration-token`
 
-  **Ephemeral Mode**: Set `RUNNER_EPHEMERAL=true` for autoscaling workflows. The runner will
-  accept one job, execute it, then the container shuts down. Combine with container
-  orchestration (Docker Compose restart policy, Kubernetes, etc.) for automatic replacement.
+  **Ephemeral Mode + Autoscaling (complementary, not contradictory)**: Set
+  `RUNNER_EPHEMERAL=true` to make the upstream runner accept exactly one job,
+  run it, and exit. Concurrency on the host comes from running multiple
+  container replicas — either via `docker compose up -d --scale gh-runner=N`
+  or via the `gh-runner-scaler` sidecar in `docker-compose.yml`, which polls
+  the GitHub API and scales the replica count based on busy/online ratio.
 
-  **Docker-in-Docker**: Mount the Docker socket (`/var/run/docker.sock`) to enable
-  container-based GitHub Actions (e.g. `uses: docker://image`).
+  **Docker-in-Docker**: Mount the Docker socket (`/var/run/docker.sock`) and
+  set `DOCKER_IN_DOCKER=true` to enable container-based GitHub Actions (e.g.
+  `uses: docker://image`). Granting socket access is host-root equivalent; on
+  shared/public CI prefer a docker-socket-proxy.
 
   **Health Monitoring**: The image includes a Docker `HEALTHCHECK` that combines
   process liveness with an active "online" sentinel refreshed by the heartbeat
@@ -110,15 +120,15 @@ app_setup_block: |
   `CLEANUP_OFFLINE_DRY_RUN=true` for the first deploy to preview what would be
   removed.
 
-  **Read-Only Mode**: Ephemeral runners support `read_only: true`. The runner is
-  installed to the immutable `/opt/runner-bin`; at startup an init step populates
-  `/opt/actions-runner` (mounted as `tmpfs` only when needed for `read_only:true`)
-  with hard links — or full copies when the runtime path is on a different
-  filesystem. **Do not mount a tmpfs or volume at `/opt/actions-runner` unless
-  you actually need read-only mode**, otherwise every cold start re-copies
-  ~200 MB of runner binaries; see the Cold-start performance section in the
-  README. Set `DISABLE_RUNNER_UPDATE=true` when running read-only since
-  auto-updates can't persist across container restarts.
+  **Filesystem layout**: The runner runs directly out of `/opt/runner-bin`,
+  which is the directory `config.sh` / `run.sh` write `.runner`,
+  `.credentials`, `_diag/`, and `_work/` into. Do **not** mount a tmpfs or
+  volume on top of `/opt/runner-bin` — the registration state lives there.
+
+  **Read-only rootfs**: A blanket `read_only: true` on the container is not
+  supported out of the box (the runner needs to write its registration state
+  to `/opt/runner-bin`). Use `no-new-privileges:true`, `cap_drop: ALL`, and
+  the minimum capability set for defense-in-depth instead.
 
   **Balena Deployment**: This image supports deployment to Balena-powered IoT and edge
   devices using `balena push <your-app-slug>`. See the `balena.yml` file and
@@ -128,31 +138,21 @@ app_setup_block: |
 readme_hwaccel: false
 
 # read-only support
-readonly_supported: true
+readonly_supported: false
 readonly_message: |
-  Read-only operation is supported in **ephemeral mode**. The runner install
-  lives at the immutable `/opt/runner-bin`; the runtime directory
-  `/opt/actions-runner` must be mounted as `tmpfs` so the runner can write its
-  registration files and `_diag/_work` directories. Required tmpfs mounts:
+  A blanket `read_only: true` on the container is not supported out of the
+  box. The runner writes its registration state (`.runner`, `.credentials`,
+  `_diag/`, `_work/`) into `/opt/runner-bin`, which is on the container's
+  writable layer. Setting `read_only: true` blocks those writes and the
+  runner fails to register.
 
-  - `/run:exec` — required by s6-overlay
-  - `/tmp:exec`
-  - `/var/log`
-  - `/opt/actions-runner:exec` — runtime tree + state (only mount when `read_only: true`; see note below)
-  - `/config:exec` — ephemeral state and work dir
-  - `/run/gh-runner` — healthcheck sentinel (auto-created inside the `/run` tmpfs)
+  For a hardened posture, use the defaults already shipped with the image:
 
-  > **Cold-start note:** the `/opt/actions-runner` tmpfs is on a different
-  > device than `/opt/runner-bin`, so the boot-time bootstrap cannot
-  > hard-link and falls back to a full recursive copy of ~200 MB of runner
-  > binaries on every container start. This is unavoidable in read-only
-  > mode. **When you don't need `read_only: true`, omit the
-  > `/opt/actions-runner` tmpfs entirely** — the bootstrap will then
-  > hard-link from the image (typically ~150 ms vs several seconds).
-
-  Set `DISABLE_RUNNER_UPDATE=true` to prevent auto-updates that would be
-  discarded on container restart. `PUID`/`PGID` and Docker Mods are not
-  honored when `read_only: true`. See the README for a full compose example.
+  - `security_opt: [ no-new-privileges:true ]`
+  - `cap_drop: [ ALL ]` plus only `CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER`
+  - tmpfs at `/run`, `/tmp`, `/var/log` so log/scratch data lives in volatile memory
+  - `RUNNER_EPHEMERAL=true` so any one container only handles one job before being recreated
+  - pin the image tag (`:<runner-version>` or `:sha-<commit>`) and audit upgrades
 
 # non-root support
 nonroot_supported: true

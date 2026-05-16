@@ -31,6 +31,7 @@ done
 
 # Make custom helper scripts executable
 [ -f /usr/local/bin/gh-runner-healthcheck ] && chmod 0755 /usr/local/bin/gh-runner-healthcheck
+[ -f /usr/local/bin/log-functions.sh ] && chmod 0644 /usr/local/bin/log-functions.sh
 
 rm -f /etc/s6-overlay/s6-rc.d/user/contents.d/svc-cron \
       /etc/s6-overlay/s6-rc.d/user/contents.d/init-crontab-config

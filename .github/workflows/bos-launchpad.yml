@@ -1,0 +1,118 @@
+# Single consumer-side workflow for docker-github-runner. Pure caller for
+# the hub's `bos-launchpad.yml` (Blackout Secure Launchpad) reusable
+# meta-workflow.
+#
+#   monitor (github_release mode → actions/runner) → release (docker → balena → github release)
+#
+# Required vars:    DOCKERHUB_NAMESPACE, BALENA_NAMESPACE
+# Required secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, BALENA_API_TOKEN
+#
+# `balena.yml` is NOT checked in; the hub renders it on each run from the
+# `balena_*` inputs below. See blackoutsecure/bos-automation-hub for the
+# full input reference.
+#
+# Private-repo notes
+# ------------------
+# 1. The hub repo `blackoutsecure/bos-automation-hub` must be set to
+#    "Accessible from repositories in the 'blackoutsecure' organization"
+#    under Settings → Actions → General → Access. Without that, the
+#    `uses:` line below fails with `workflow was not found`.
+# 2. The upstream `actions/runner` is public, so no `UPSTREAM_TOKEN` is
+#    needed. If the launchpad ever points at a private upstream, add the
+#    secret to the `secrets:` block below.
+name: Blackout Secure Launchpad
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # stagger off :00 to dodge org cron pile-ups
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'build/**'
+      - 'root/**'
+      - 'docker-compose.yml'
+      - 'README.md'
+      - '.github/upstream/**'
+      - '.github/workflows/bos-launchpad.yml'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: Run the pipeline even if upstream is unchanged.
+        type: boolean
+        default: false
+
+# No top-level `concurrency:` — the hub workflow owns serialization.
+# Declaring it on both sides triggers a GHA self-deadlock.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    permissions:
+      contents:        write   # monitor tracking-file commit + GitHub Release publish
+      actions:         write   # nested monitor (`gh workflow run`)
+      pull-requests:   write   # nested Docker Scout PR annotations
+      security-events: write   # nested Docker Scout SARIF upload
+    uses: blackoutsecure/bos-automation-hub/.github/workflows/bos-launchpad.yml@main
+    with:
+      upstream_repo:    actions/runner
+      track_file:       .github/upstream/actions-runner.json
+      # Push events should always rebuild; schedule only when upstream moves.
+      force_release:    ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_release) }}
+
+      image_name:          github-runner
+      dockerhub_namespace: ${{ vars.DOCKERHUB_NAMESPACE }}
+      block_name:          github-runner
+      balena_namespace:    ${{ vars.BALENA_NAMESPACE }}
+
+      # Render balena.yml dynamically — no checked-in copy.
+      balena_generate_yml: true
+
+      # Preserve the historical device-type matrix from the old balena.yml.
+      balena_default_device_type: raspberrypi3-64
+      balena_supported_device_types: |
+        raspberrypi3
+        raspberrypi3-64
+        raspberrypi4
+        raspberrypi4-64
+        raspberrypi400
+        raspberrypi400-64
+        intel-nuc
+        genericx86-64-ext
+
+      balena_description: >-
+        Containerized GitHub Actions self-hosted runner with s6 process supervision,
+        non-root defaults, and ephemeral mode support. Features automatic token
+        generation via GitHub PAT, Docker-in-Docker support, and built-in health
+        monitoring for CI/CD workloads on IoT and edge devices.
+      balena_post_provisioning: |
+        ## Usage instructions
+
+        Include this snippet in your docker-compose.yml file under 'services':
+
+          ```
+          gh-runner:
+            image: docker.io/${{ vars.DOCKERHUB_NAMESPACE }}/github-runner:latest
+            restart: unless-stopped
+            environment:
+              - TZ=Etc/UTC
+              - RUNNER_URL=https://github.com/OWNER/REPO
+              - RUNNER_TOKEN=YOUR_REGISTRATION_TOKEN
+              - RUNNER_NAME=my-runner
+              - LOG_LEVEL=info
+            volumes:
+              - '/path/to/runner/config:/config'
+              - '/var/run/docker.sock:/var/run/docker.sock'
+            security_opt:
+              - 'no-new-privileges:true'
+          ```
+
+        Repository: https://github.com/${{ github.repository }}
+        Upstream application: https://github.com/actions/runner
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
+      BALENA_API_TOKEN:   ${{ secrets.BALENA_API_TOKEN }}

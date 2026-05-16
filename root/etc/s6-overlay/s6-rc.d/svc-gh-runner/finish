@@ -14,27 +14,9 @@ set -uo pipefail
 if [[ -w /proc/1/fd/1 ]]; then exec 1>>/proc/1/fd/1; fi
 if [[ -w /proc/1/fd/2 ]]; then exec 2>>/proc/1/fd/2; fi
 
-_log_severity() {
-    case "${1,,}" in
-        debug) echo 10 ;;
-        info)  echo 20 ;;
-        warn)  echo 30 ;;
-        error) echo 40 ;;
-        fatal) echo 50 ;;
-        *)     echo 20 ;;
-    esac
-}
-
-log() {
-    local level="$1"; shift
-    local cur min
-    cur=$(_log_severity "${level}")
-    min=$(_log_severity "${LOG_LEVEL:-info}")
-    if [[ "${level,,}" != "fatal" && "${cur}" -lt "${min}" ]]; then
-        return 0
-    fi
-    printf '%s svc-gh-runner[%s]: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${level}" "$*"
-}
+# shellcheck disable=SC1091
+. /usr/local/bin/log-functions.sh
+LOG_TAG="svc-gh-runner"
 
 EXIT_CODE="$1"
 

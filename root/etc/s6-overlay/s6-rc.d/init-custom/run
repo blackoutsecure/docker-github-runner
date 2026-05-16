@@ -7,51 +7,27 @@
 # Runs as root (s6 init sequence). The runner service itself still drops
 # to the LSIO `abc` user (uid 911) via s6-setuidgid afterwards.
 #
-# This step is OPTIONAL. It is intentionally a no-op when none of the
-# trigger variables are set, so the default container behaviour is unchanged.
+# This step is a no-op when none of the trigger variables are set.
 #
 # Variables:
-#   EXTRA_APT_REPOS   Semicolon-separated apt repository lines to add to
+#   EXTRA_APT_REPOS   Semicolon-separated apt repository lines added to
 #                     /etc/apt/sources.list.d/extra.list before installing.
-#                     Example: "deb http://example/repo stable main"
-#   EXTRA_PACKAGES    Space-separated list of apt package names to install.
-#                     Names are validated against ^[a-z0-9][a-z0-9+.\-]+$
-#                     to prevent shell injection from untrusted env vars.
-#   EXTRA_INIT_SCRIPT Path inside the container to a shell script to run
-#                     after package installation (typically bind-mounted).
-#                     Runs with `set -e`; failure aborts container startup.
+#   EXTRA_PACKAGES    Space-separated apt package names; validated against
+#                     ^[a-z0-9][a-z0-9+.\-]+$ to block shell injection.
+#   EXTRA_INIT_SCRIPT Path to a shell script (typically bind-mounted RO)
+#                     run with `set -e` after package installation.
 #
-# WARNING: incompatible with read_only: true (apt needs to write to the
-# rootfs). The script aborts with a clear error if it detects a read-only
-# rootfs and EXTRA_PACKAGES is set.
+# Incompatible with read-only rootfs (apt needs to write). Aborts with a
+# clear error if the rootfs is read-only and EXTRA_PACKAGES is set.
 #
-# For repeated use, building a custom image (FROM blackoutsecure/docker-github-runner,
-# then RUN apt-get install ...) is dramatically faster than re-installing
-# packages on every container start (especially in ephemeral mode).
+# For repeated use, build a custom image (FROM blackoutsecure/github-runner)
+# instead of reinstalling on every container start.
 #
 set -uo pipefail
 
-_log_severity() {
-    case "${1,,}" in
-        debug) echo 10 ;;
-        info)  echo 20 ;;
-        warn)  echo 30 ;;
-        error) echo 40 ;;
-        fatal) echo 50 ;;
-        *)     echo 20 ;;
-    esac
-}
-
-log() {
-    local level="$1"; shift
-    local cur min
-    cur=$(_log_severity "${level}")
-    min=$(_log_severity "${LOG_LEVEL:-info}")
-    if [[ "${level,,}" != "fatal" && "${cur}" -lt "${min}" ]]; then
-        return 0
-    fi
-    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') init-custom[${level}]: $*"
-}
+# shellcheck disable=SC1091
+. /usr/local/bin/log-functions.sh
+LOG_TAG="init-custom"
 
 # Normalize: trim whitespace and treat whitespace-only values as unset.
 # Prevents accidentally enabling the step with a value like "   " (e.g.

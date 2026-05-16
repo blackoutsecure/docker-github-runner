@@ -2,31 +2,9 @@
 # shellcheck shell=bash
 set -euo pipefail
 
-# Numeric severity for level-filtering; lines below LOG_LEVEL are dropped.
-# Levels (case-insensitive): debug < info < warn < error < fatal
-# 'fatal' is always shown (it precedes exit). Default LOG_LEVEL=info.
-_log_severity() {
-    case "${1,,}" in
-        debug) echo 10 ;;
-        info)  echo 20 ;;
-        warn)  echo 30 ;;
-        error) echo 40 ;;
-        fatal) echo 50 ;;
-        *)     echo 20 ;;
-    esac
-}
-
-log() {
-    local level="$1"; shift
-    local cur min
-    cur=$(_log_severity "${level}")
-    min=$(_log_severity "${LOG_LEVEL:-info}")
-    # Always print fatal regardless of threshold
-    if [[ "${level,,}" != "fatal" && "${cur}" -lt "${min}" ]]; then
-        return 0
-    fi
-    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') init-gh-runner-config[${level}]: $*"
-}
+# shellcheck disable=SC1091
+. /usr/local/bin/log-functions.sh
+LOG_TAG="init-gh-runner-config"
 
 log "info" "Initializing GitHub Actions self-hosted runner"
 
@@ -63,7 +41,7 @@ prefix_lines() {
         -e 's/\xe2\x9c\x98/[X]/g'  \
         -e 's/\xe2\x86\x92/->/g'   \
         -e 's/[^[:print:]\t]//g' \
-    | stdbuf -oL awk -v tag="${tag}" '
+    | stdbuf -oL awk -v tag="${tag}" -v log_tag="${LOG_TAG}" '
         # The GitHub Actions config.sh prints a boxed ASCII-art banner
         # framed by lines of dashes (e.g. "------...------") with "|...|"
         # rows in between. The image-startup banner is framed by lines
@@ -116,7 +94,7 @@ prefix_lines() {
             cmd = "date -u +%Y-%m-%dT%H:%M:%SZ"
             cmd | getline ts
             close(cmd)
-            printf "%s init-gh-runner-config[%s]: %s\n", ts, tag, $0
+            printf "%s %s[%s]: %s\n", ts, log_tag, tag, $0
             fflush()
         }
     '
@@ -162,7 +140,7 @@ as_runner_user() {
 case "${LOG_LEVEL:-info}" in
     debug|info|warn|error|fatal|DEBUG|INFO|WARN|ERROR|FATAL) : ;;
     *)
-        echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') init-gh-runner-config[warn]: Unknown LOG_LEVEL='${LOG_LEVEL}', falling back to 'info' (valid: debug|info|warn|error|fatal)"
+        echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') ${LOG_TAG}[warn]: Unknown LOG_LEVEL='${LOG_LEVEL}', falling back to 'info' (valid: debug|info|warn|error|fatal)"
         export LOG_LEVEL="info"
         ;;
 esac
