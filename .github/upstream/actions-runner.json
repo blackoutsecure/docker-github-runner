@@ -1,5 +1,6 @@
 {
+  "repo": "actions/runner",
+  "tag": "v2.334.0",
   "version": "2.334.0",
-  "commit": "f1995ede5d885c997d13d8eca5467c4ce97fe69c",
-  "published_at": "2026-04-21T18:54:03Z"
+  "commit": "f1995ede5d885c997d13d8eca5467c4ce97fe69c"
 }
