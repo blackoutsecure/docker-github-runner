@@ -14,7 +14,6 @@ networks:
 services:
   gh-runner:
     image: docker.io/blackoutsecure/github-runner:latest
-    container_name: gh-runner
     networks:
       - gh-runner-isolated
     environment:
@@ -42,7 +41,6 @@ services:
       io.balena.features.balena-socket: '1'
 
     ipc: "private"
-    uts_mode: "host"
     dns_search: []
 
     security_opt:
