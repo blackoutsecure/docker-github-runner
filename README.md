@@ -14,8 +14,9 @@ Unofficial community container image for the [GitHub Actions Runner](https://git
 
 Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app/).
 
-> **Naming**
+> **Image & Listings**
 > - **Docker Hub image:** [`blackoutsecure/github-runner`](https://hub.docker.com/r/blackoutsecure/github-runner)
+> - **Balena Marketplace:** [github-runner](https://hub.balena.io/blocks/2362920/github-runner)
 > - **GitHub repository:** [`blackoutsecure/docker-github-runner`](https://github.com/blackoutsecure/docker-github-runner)
 >
 > The image is *not* an official LinuxServer.io release.
