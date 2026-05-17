@@ -202,41 +202,20 @@ fi
 # Runner runtime directory.
 #
 # The runner is installed to /opt/runner-bin at image build time, owned by
-# the abc runner user with read-only files but writable directories so the
-# runner can drop its registration files (.runner, .credentials, .env,
-# .path, _diag/, _work/, ...) into the tree at runtime.
-#
-# Earlier revisions copied or hard-linked this tree into a separate
-# /opt/actions-runner runtime dir at every container start, but on
-# overlayfs `cp -al` of ~9000 files took ~140 s -- the dominant cold-start
-# cost for ephemeral runners. We now run the listener directly from
-# /opt/runner-bin: writes go to the container's upper overlay layer (or a
-# tmpfs if the operator chose to mount one) and are wiped on container
-# recreation, which matches the lifecycle of an ephemeral runner.
-#
-# /proc/self/exe always resolves to the *real* path, so .NET picks
-# /opt/runner-bin as the install root and writes state next to it where
-# abc has owner +wx on every subdirectory.
+# the abc user. Files are read-only; directories stay writable so the runner
+# can drop its registration files (.runner, .credentials, .env, .path,
+# _diag/, _work/) into the tree at runtime. /proc/self/exe resolves to
+# /opt/runner-bin so .NET picks it as the install root.
 # ---------------------------------------------------------------------------
 RUNNER_DIR="/opt/runner-bin"
 
 if [[ -d "${RUNNER_DIR}" ]]; then
-    # Defensive ownership/permission fix-up. The build-time install already
-    # chowns to abc:abc with 0755 dirs, but a restored volume, an older
-    # image revision, or a restrictive mount could have flipped that --
-    # without owner +wx on the dirs the runner can't create _diag/ etc.
-    #
-    # FAST PATH: the build-time install drops a `.ownership-baked` marker
-    # (owned abc:abc, mode 0444) into ${RUNNER_DIR}. If it's still present
-    # we trust it absolutely and skip the recursive chown/chmod walks --
-    # on slow ARM storage those walks over ~9000 files take 60-130 s of
-    # silent cold-start time. The previous stat-based probe was unreliable
-    # on balena/overlayfs (it sometimes reported stale uids for files on
-    # the immutable image layer and forced a needless re-chown).
-    #
-    # Operators who flip ownership manually (or restore a stale volume
-    # over the runner dir) can force the legacy fix-up by passing
-    # FORCE_RUNNER_PERMISSIONS_FIX=true.
+    # Defensive ownership/permission fix-up. The build-time install drops
+    # `.ownership-baked` (owned abc:abc, 0444); if present we trust it and
+    # skip the recursive chown/chmod walks -- on slow ARM storage those walks
+    # over ~9000 files take 60-130s of silent cold-start time. Operators who
+    # flip ownership manually (or restore a stale volume) can force the walk
+    # by setting FORCE_RUNNER_PERMISSIONS_FIX=true.
     _force_perm_fix="${FORCE_RUNNER_PERMISSIONS_FIX:-false}"
     _marker="${RUNNER_DIR}/.ownership-baked"
     if [[ "${_force_perm_fix,,}" != "true" && -f "${_marker}" ]]; then
@@ -1101,12 +1080,20 @@ api_list_runners() {
 # ---------------------------------------------------------------------------
 # Helper: check if a runner name is taken by an ONLINE runner.
 # Returns 0 if taken (online), 1 if not found or offline.
+#
+# Uses a literal-string match (not a regex) so runner names that happen to
+# contain regex metacharacters (e.g. a hostname like "runner-1.local"
+# where '.' would otherwise match any byte) are compared correctly.
 # ---------------------------------------------------------------------------
 is_runner_name_active() {
     local name="$1"
     local runner_list="$2"
-
-    echo "${runner_list}" | grep -q "^${name}	online$"
+    local needle line
+    needle="${name}"$'\t'"online"
+    while IFS= read -r line; do
+        [[ "${line}" == "${needle}" ]] && return 0
+    done <<< "${runner_list}"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1965,7 +1952,17 @@ if [[ ! -f ".runner" ]]; then
         if api_remove_runner_by_name "${RUNNER_NAME}"; then
             log "info" "Retrying config.sh after API removal..."
             clean_local_runner_config
-            as_runner_user ./config.sh "${CONFIG_ARGS[@]}" 2>&1 | prefix_lines config
+            # Wrap the retry pipeline in an explicit guard so we emit a
+            # clear fatal message instead of dying silently via `set -e`
+            # if the retry also fails (which would otherwise just exit
+            # with whatever the last pipeline element's status was, and
+            # operators would have to scroll up through prefix_lines
+            # output to figure out what died).
+            if ! as_runner_user ./config.sh "${CONFIG_ARGS[@]}" 2>&1 | prefix_lines config; then
+                log "fatal" "config.sh failed AFTER API removal of conflicting runner -- giving up"
+                log "fatal" "Check the 'config' output lines above for the underlying error from the runner registration"
+                exit 1
+            fi
         else
             log "fatal" "Unable to resolve runner name conflict for '${RUNNER_NAME}'"
             log "fatal" "Ensure the PAT has admin scope or manually remove the stale runner from GitHub"

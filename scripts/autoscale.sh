@@ -2,31 +2,89 @@
 # =============================================================================
 # gh-runner-autoscaler — Dynamic scaling for GitHub Actions self-hosted runners
 #
-# Monitors runner status via the GitHub API and scales the companion
-# `gh-runner` compose service between SCALE_MIN and SCALE_MAX replicas.
+# Polls the GitHub API for the busy/online runner ratio and asks a
+# configurable BACKEND to adjust the runner pool size between
+# SCALE_MIN and SCALE_MAX.
 #
-# Required environment variables:
+# The demand-detection loop (API polling, busy% math, cooldown, idle-name
+# selection) is orchestrator-agnostic; only the per-backend scaling primitive
+# changes. This makes the script work natively on Docker Compose AND on
+# anything you can drive from a shell command — kubectl, balena-cli, docker
+# swarm, nomad, your CI, etc. — without forking the script.
+#
+# Backends (SCALE_BACKEND env):
+#   compose  (default) — Calls `docker compose --scale gh-runner=N`.
+#                        Requires docker.sock + the rendered compose file.
+#   exec               — Calls an operator-supplied command for every replica
+#                        operation. Portable to ANY orchestrator. Required
+#                        env: SCALE_EXEC=<path-or-command>. The command is
+#                        invoked with one of three verbs:
+#                          $SCALE_EXEC count            -> print current replica count to stdout
+#                          $SCALE_EXEC scale <N>        -> scale the pool to N replicas
+#                          $SCALE_EXEC remove <name>... -> graceful-down by runner name (optional)
+#                        Set SCALE_EXEC_SUPPORTS_REMOVE=true to enable the
+#                        graceful `remove` verb; otherwise the script falls
+#                        back to naive `scale` for scale-in events.
+#   emit               — Read-only "decision-as-a-service" mode. Writes a
+#                        JSON state file each cycle and NEVER scales locally.
+#                        External systems (GitHub Actions cron, balena-cli
+#                        from a workstation, an Argo/Tekton pipeline) consume
+#                        the file and apply the scaling action however they
+#                        like. Required env: SCALE_EMIT_FILE=<path>.
+#
+# Required environment variables (always):
 #   RUNNER_URL      — GitHub repo/org/enterprise URL
 #   GITHUB_PAT      — PAT with admin:org or repo scope (for runner list API)
 #
-# Scaling variables:
+# Per-fleet scope filters (apply to ALL GitHub API queries; default = no filter):
+#   RUNNER_SCOPE_LABELS      Comma-separated label set. Only runners whose
+#                            label set is a SUPERSET of this list are counted.
+#                            Match is case-insensitive. Example:
+#                              RUNNER_SCOPE_LABELS="self-hosted,arm64,prod"
+#                            CRITICAL when multiple runner fleets (e.g. an
+#                            arm64 pool and an x64 pool) share the same
+#                            org/repo — without this the autoscaler sees
+#                            ALL runners and makes wrong scaling decisions
+#                            for each fleet. The GitHub-auto labels `ARM64`
+#                            / `X64` / `Linux` are reliable discriminators.
+#   RUNNER_SCOPE_NAME_REGEX  Optional jq-flavor (PCRE) regex applied to the
+#                            runner `.name` field. Useful when fleets share
+#                            labels but use distinct name prefixes (e.g.
+#                            "^arm-runner-"). AND-combined with the label
+#                            filter above.
+#
+# Scaling variables (apply to all backends):
 #   SCALE_MIN       — Minimum runners to keep alive (default: 1)
-#   SCALE_MAX       — Maximum runners allowed      (default: 1)
+#   SCALE_MAX       — Maximum runners allowed       (default: 1)
 #   SCALE_MODE      — "auto" (default) or "fixed"
 #                     auto  = scale between MIN..MAX based on demand
 #                     fixed = always run exactly SCALE_MAX runners
 #   SCALE_INTERVAL  — Seconds between scaling checks (default: 30)
-#   SCALE_COOLDOWN  — Seconds to wait after a scale event before another (default: 60)
-#   SCALE_UP_THRESHOLD   — Busy-ratio to trigger scale-up   (default: 0.8 = 80%)
-#   SCALE_DOWN_THRESHOLD — Busy-ratio to trigger scale-down (default: 0.2 = 20%)
+#   SCALE_COOLDOWN  — Seconds between scale events  (default: 60)
+#   SCALE_UP_THRESHOLD   — Busy-ratio % to trigger scale-up   (default: 80)
+#   SCALE_DOWN_THRESHOLD — Busy-ratio % to trigger scale-down (default: 20)
+#
+# Compose backend (SCALE_BACKEND=compose):
+#   COMPOSE_SERVICE — Compose service name to scale (default: gh-runner)
+#   COMPOSE_PROJECT — Optional compose project name
+#   COMPOSE_FILE    — Compose file path (default: docker-compose.yml)
+#
+# Exec backend (SCALE_BACKEND=exec):
+#   SCALE_EXEC                  — Required. Path or shell command.
+#   SCALE_EXEC_SUPPORTS_REMOVE  — 'true' if your wrapper implements
+#                                 `remove <name>...` for graceful scale-down.
+#
+# Emit backend (SCALE_BACKEND=emit):
+#   SCALE_EMIT_FILE — Required. Path to write JSON state file.
 #
 # Usage:
-#   Typically run as a compose service — see the Autoscaling section in README.md
-#   Can also be run standalone: ./scripts/autoscale.sh
+#   Typically run as a compose service — see the Autoscaling section in README.md.
+#   Can also be run standalone:  RUNNER_URL=... GITHUB_PAT=... ./scripts/autoscale.sh
 # =============================================================================
 set -uo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
+SCALE_BACKEND="${SCALE_BACKEND:-compose}"
 SCALE_MIN="${SCALE_MIN:-1}"
 SCALE_MAX="${SCALE_MAX:-1}"
 SCALE_MODE="${SCALE_MODE:-auto}"
@@ -34,15 +92,41 @@ SCALE_INTERVAL="${SCALE_INTERVAL:-30}"
 SCALE_COOLDOWN="${SCALE_COOLDOWN:-60}"
 SCALE_UP_THRESHOLD="${SCALE_UP_THRESHOLD:-80}"
 SCALE_DOWN_THRESHOLD="${SCALE_DOWN_THRESHOLD:-20}"
+# Compose backend
 COMPOSE_SERVICE="${COMPOSE_SERVICE:-gh-runner}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
+# Exec backend
+SCALE_EXEC="${SCALE_EXEC:-}"
+SCALE_EXEC_SUPPORTS_REMOVE="${SCALE_EXEC_SUPPORTS_REMOVE:-false}"
+# Emit backend
+SCALE_EMIT_FILE="${SCALE_EMIT_FILE:-}"
+# Per-fleet scope filters
+RUNNER_SCOPE_LABELS="${RUNNER_SCOPE_LABELS:-}"
+RUNNER_SCOPE_NAME_REGEX="${RUNNER_SCOPE_NAME_REGEX:-}"
 
 log() {
     echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') autoscaler[$1]: $2"
 }
 
+# Clamp $1 into the inclusive range [$2, $3].
+clamp() {
+    local v="$1" lo="$2" hi="$3"
+    if   [[ "${v}" -lt "${lo}" ]]; then echo "${lo}"
+    elif [[ "${v}" -gt "${hi}" ]]; then echo "${hi}"
+    else echo "${v}"
+    fi
+}
+
 # ── Validation ────────────────────────────────────────────────────────────────
+case "${SCALE_BACKEND}" in
+    compose|exec|emit) ;;
+    *)
+        log "fatal" "SCALE_BACKEND='${SCALE_BACKEND}' is not supported. Valid: compose | exec | emit"
+        exit 1
+        ;;
+esac
+
 if [[ -z "${GITHUB_PAT:-}" ]]; then
     log "fatal" "GITHUB_PAT is required for the autoscaler to query runner status"
     exit 1
@@ -63,6 +147,49 @@ if [[ "${SCALE_MAX}" -lt "${SCALE_MIN}" ]]; then
     SCALE_MAX="${SCALE_MIN}"
 fi
 
+case "${SCALE_BACKEND}" in
+    exec)
+        if [[ -z "${SCALE_EXEC}" ]]; then
+            log "fatal" "SCALE_BACKEND=exec requires SCALE_EXEC=<path or command>"
+            exit 1
+        fi
+        ;;
+    emit)
+        if [[ -z "${SCALE_EMIT_FILE}" ]]; then
+            log "fatal" "SCALE_BACKEND=emit requires SCALE_EMIT_FILE=<path>"
+            exit 1
+        fi
+        ;;
+esac
+
+# Validate the scope regex compiles before entering the loop, so a typo
+# becomes a startup fatal instead of a per-cycle silent no-op.
+if [[ -n "${RUNNER_SCOPE_NAME_REGEX}" ]]; then
+    if ! echo "x" | jq -Rr --arg r "${RUNNER_SCOPE_NAME_REGEX}" '. | test($r)' >/dev/null 2>&1; then
+        log "fatal" "RUNNER_SCOPE_NAME_REGEX='${RUNNER_SCOPE_NAME_REGEX}' is not a valid jq regex"
+        exit 1
+    fi
+fi
+
+# Normalize the required-label set ONCE: trim, drop empties, lowercase,
+# JSON-encode as a string array. Empty array = no label filter.
+_SCOPE_LABELS_JSON='[]'
+if [[ -n "${RUNNER_SCOPE_LABELS}" ]]; then
+    _SCOPE_LABELS_JSON="$(printf '%s' "${RUNNER_SCOPE_LABELS}" \
+        | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | awk 'NF' \
+        | tr '[:upper:]' '[:lower:]' \
+        | jq -R . | jq -c -s '.')"
+    if [[ -z "${_SCOPE_LABELS_JSON}" || "${_SCOPE_LABELS_JSON}" == "null" ]]; then
+        _SCOPE_LABELS_JSON='[]'
+    fi
+fi
+
+# Pre-compute compose CLI args once (never change at runtime).
+COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
+[[ -n "${COMPOSE_PROJECT}" ]] && COMPOSE_ARGS+=(-p "${COMPOSE_PROJECT}")
+
 # ── Resolve API URL ──────────────────────────────────────────────────────────
 resolve_runners_api_url() {
     local url_path="${RUNNER_URL#https://github.com/}"
@@ -80,133 +207,102 @@ resolve_runners_api_url() {
 
 RUNNERS_API_URL="$(resolve_runners_api_url)"
 
-# ── Runner status query ──────────────────────────────────────────────────────
-# Returns: total online busy
-get_runner_counts() {
-    local page=1 total_online=0 total_busy=0
+# ── Runner status query (per-cycle cached) ──────────────────────────────────
+# A single paginated GET /actions/runners fetch per scaling cycle feeds both
+# the count summary AND the idle-name selector. Caching here halves API calls
+# per cycle (rate-limit friendly) and avoids racing between two fetches.
+# Capped at 10 pages × 100 = 1000 runners — far above any realistic
+# self-hosted fleet size.
 
-    while [[ "${page}" -le 10 ]]; do
-        local resp
-        resp="$(curl -fsSL \
-            -H "Authorization: token ${GITHUB_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            "${RUNNERS_API_URL}?per_page=100&page=${page}" 2>/dev/null)" || {
-            echo "0 0"
-            return 1
-        }
+RUNNERS_JSON_CACHE='[]'
 
-        local online busy count
-        online="$(echo "${resp}" | jq '[.runners[] | select(.status == "online")] | length' 2>/dev/null || echo 0)"
-        busy="$(echo "${resp}" | jq '[.runners[] | select(.status == "online" and .busy == true)] | length' 2>/dev/null || echo 0)"
-        count="$(echo "${resp}" | jq '.runners | length' 2>/dev/null || echo 0)"
-
-        total_online=$((total_online + online))
-        total_busy=$((total_busy + busy))
-
-        if [[ "${count}" -lt 100 ]]; then
-            break
-        fi
-        page=$((page + 1))
-    done
-
-    echo "${total_online} ${total_busy}"
+# Narrow a runners[] JSON blob (stdin) to just this fleet's runners, using
+# the pre-normalized RUNNER_SCOPE_LABELS subset match AND the optional
+# RUNNER_SCOPE_NAME_REGEX. No-op when both filters are empty.
+_apply_scope_filter() {
+    jq -c \
+        --argjson required "${_SCOPE_LABELS_JSON}" \
+        --arg regex "${RUNNER_SCOPE_NAME_REGEX}" \
+        '
+        map(
+            (([.labels[]?.name // ""] | map(ascii_downcase)) as $have
+             | (if ($required | length) == 0 then true
+                else ($required | all(. as $w | $have | index($w))) end) as $label_ok
+             | (if $regex == "" then true
+                else (.name | test($regex)) end) as $name_ok
+             | select($label_ok and $name_ok))
+        )
+        '
 }
 
-# Returns newline-separated names of online + idle (busy=false) runners.
-# Used by graceful_scale_down to pick safe scale-in targets in ephemeral mode.
-get_idle_runner_names() {
-    local page=1
+# Returns the merged + scope-filtered runners[] array on stdout, exit 0 on
+# success.
+_fetch_runners_json() {
+    local page=1 acc='[]' resp page_runners count
     while [[ "${page}" -le 10 ]]; do
-        local resp
         resp="$(curl -fsSL \
             -H "Authorization: token ${GITHUB_PAT}" \
             -H "Accept: application/vnd.github+json" \
             "${RUNNERS_API_URL}?per_page=100&page=${page}" 2>/dev/null)" || return 1
-
-        echo "${resp}" | jq -r '.runners[] | select(.status == "online" and .busy == false) | .name' 2>/dev/null
-
-        local count
-        count="$(echo "${resp}" | jq '.runners | length' 2>/dev/null || echo 0)"
-        if [[ "${count}" -lt 100 ]]; then
-            break
-        fi
+        page_runners="$(jq -c '.runners // []' <<< "${resp}" 2>/dev/null)" || return 1
+        count="$(jq 'length' <<< "${page_runners}" 2>/dev/null || echo 0)"
+        acc="$(jq -c -s 'add' <<< "${acc}${page_runners}" 2>/dev/null)" || return 1
+        [[ "${count}" -lt 100 ]] && break
         page=$((page + 1))
     done
+    printf '%s' "${acc}" | _apply_scope_filter
 }
 
-# ── Compose scaling ──────────────────────────────────────────────────────────
-get_current_replicas() {
-    local compose_args=(-f "${COMPOSE_FILE}")
-    if [[ -n "${COMPOSE_PROJECT}" ]]; then
-        compose_args+=(-p "${COMPOSE_PROJECT}")
+# Refresh RUNNERS_JSON_CACHE. Returns non-zero on API failure so the caller
+# can skip the cycle cleanly (fixes the pre-existing silent-failure where
+# `read <<< "$(get_runner_counts)"` always succeeded even when the API was
+# unreachable, masking outages as "0 online, 0 busy").
+refresh_runners_cache() {
+    local fresh
+    if ! fresh="$(_fetch_runners_json)"; then
+        return 1
     fi
+    RUNNERS_JSON_CACHE="${fresh}"
+}
 
-    docker compose "${compose_args[@]}" ps --format json "${COMPOSE_SERVICE}" 2>/dev/null \
+# Echoes "online busy" from the cache.
+cached_runner_counts() {
+    local online busy
+    online="$(jq '[ .[] | select(.status == "online") ] | length' <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null || echo 0)"
+    busy="$(jq   '[ .[] | select(.status == "online" and .busy == true) ] | length' <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null || echo 0)"
+    echo "${online} ${busy}"
+}
+
+# Newline-separated names of online + idle (busy=false) runners.
+cached_idle_runner_names() {
+    jq -r '.[] | select(.status == "online" and .busy == false) | .name' \
+        <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null
+}
+
+# ── Backend: compose ─────────────────────────────────────────────────────────
+_compose_get_current_replicas() {
+    docker compose "${COMPOSE_ARGS[@]}" ps --format json "${COMPOSE_SERVICE}" 2>/dev/null \
         | jq -s 'length' 2>/dev/null || echo 0
 }
 
-scale_to() {
+_compose_scale_to() {
     local target="$1"
-    local compose_args=(-f "${COMPOSE_FILE}")
-    if [[ -n "${COMPOSE_PROJECT}" ]]; then
-        compose_args+=(-p "${COMPOSE_PROJECT}")
-    fi
-
-    log "info" "Scaling ${COMPOSE_SERVICE} to ${target} replicas..."
-
-    if docker compose "${compose_args[@]}" up -d --scale "${COMPOSE_SERVICE}=${target}" --no-recreate 2>&1; then
+    log "info" "Scaling ${COMPOSE_SERVICE} to ${target} replicas (compose)..."
+    if docker compose "${COMPOSE_ARGS[@]}" up -d --scale "${COMPOSE_SERVICE}=${target}" --no-recreate 2>&1; then
         log "info" "Scale to ${target} successful"
         return 0
-    else
-        log "warn" "Scale command failed"
-        return 1
     fi
+    log "warn" "Scale command failed"
+    return 1
 }
 
-# Graceful scale-down for ephemeral runners.
-#
-# In ephemeral mode each container handles exactly ONE job and then exits;
-# capacity for concurrent jobs is the replica count. A naive
-# `compose --scale=N` removes containers in compose's index order, NOT by
-# busy/idle state -- so it can abort an in-flight job. This function:
-#
-#   1. Asks GitHub which runners are currently online + idle (busy=false).
-#   2. Resolves each idle runner name -> local docker container ID by
-#      hostname (the runner registers with its container hostname when
-#      RUNNER_NAME is unset, the recommended ephemeral pattern).
-#   3. `docker stop`s the chosen idle containers so the s6 finish hook
-#      runs (clean GitHub deregister) and Docker honours the stop intent
-#      (won't be auto-restarted by `restart: always`).
-#   4. Reconciles compose's view with `compose up --scale=target`.
-#
-# If we cannot find enough idle runners (e.g. they all just picked up
-# jobs between the API poll and now), we DO NOT fall back to killing
-# busy containers; we keep the current count and try again next interval.
-# This trades a slower scale-down for never aborting a user's workflow.
-graceful_scale_down() {
-    local target="$1"
-    local current="$2"
-    local need=$(( current - target ))
-
-    if [[ "${need}" -le 0 ]]; then
-        return 0
-    fi
-
-    log "info" "Graceful scale-down: need to retire ${need} idle replica(s) (target=${target})"
-
-    local idle_names
-    idle_names="$(get_idle_runner_names || true)"
-    if [[ -z "${idle_names}" ]]; then
-        log "info" "No idle runners available to retire -- deferring scale-down"
-        return 1
-    fi
-
-    local retired=0
-    local cid
-    while IFS= read -r name; do
+# Stop specific replicas by GitHub runner name. Resolves each name to a local
+# container ID via container hostname / explicit name, then `docker stop`s it.
+# Prints the number of actually-retired containers to stdout (0 on full fail).
+_compose_remove_by_names() {
+    local retired=0 name cid
+    for name in "$@"; do
         [[ -z "${name}" ]] && continue
-        [[ "${retired}" -ge "${need}" ]] && break
-
         # When RUNNER_NAME is unset, the runner registers with its container
         # hostname (= short container ID, 12 chars). Match by container ID
         # prefix OR by container name (covers explicit RUNNER_NAME too).
@@ -226,33 +322,189 @@ graceful_scale_down() {
         else
             log "warn" "docker stop ${cid:0:12} failed -- skipping"
         fi
-    done <<< "${idle_names}"
+    done
+    # Reconcile compose's view; stopped containers still count as replicas in
+    # `compose ps` until reaped.
+    if [[ "${retired}" -gt 0 ]]; then
+        docker compose "${COMPOSE_ARGS[@]}" rm -fsv "${COMPOSE_SERVICE}" >/dev/null 2>&1 || true
+    fi
+    echo "${retired}"
+}
 
-    if [[ "${retired}" -eq 0 ]]; then
-        log "warn" "Could not retire any idle runners -- deferring scale-down"
+# ── Backend: exec ────────────────────────────────────────────────────────────
+# SCALE_EXEC is operator-supplied (set via env when launching the sidecar) and
+# may legitimately contain arguments (e.g. SCALE_EXEC="kubectl -n ci"), so we
+# intentionally leave it unquoted to allow word-splitting. It is NEVER derived
+# from runner-supplied input.
+_exec_get_current_replicas() {
+    local out
+    # shellcheck disable=SC2086
+    if out="$(${SCALE_EXEC} count 2>/dev/null)"; then
+        out="${out//[[:space:]]/}"
+        if [[ "${out}" =~ ^[0-9]+$ ]]; then
+            echo "${out}"
+            return 0
+        fi
+    fi
+    log "warn" "exec backend: '${SCALE_EXEC} count' did not return a non-negative integer (got: '${out:-}')"
+    echo 0
+}
+
+_exec_scale_to() {
+    local target="$1"
+    log "info" "Scaling to ${target} replicas via SCALE_EXEC scale ${target}"
+    # shellcheck disable=SC2086
+    if ${SCALE_EXEC} scale "${target}"; then
+        log "info" "Scale to ${target} successful"
+        return 0
+    fi
+    log "warn" "exec backend: scale ${target} failed"
+    return 1
+}
+
+# Optional graceful-down. If SCALE_EXEC_SUPPORTS_REMOVE=true, invoke
+# `$SCALE_EXEC remove <name>...`. Print retired count on success, return
+# non-zero (with no stdout) to signal the caller to fall back to naive
+# scale-to-target.
+_exec_remove_by_names() {
+    if [[ "${SCALE_EXEC_SUPPORTS_REMOVE}" != "true" ]]; then
+        return 1
+    fi
+    log "info" "Retiring ${#} idle runner(s) via SCALE_EXEC remove"
+    # shellcheck disable=SC2086
+    if ${SCALE_EXEC} remove "$@"; then
+        echo "${#}"
+        return 0
+    fi
+    log "warn" "exec backend: remove failed"
+    return 1
+}
+
+# ── Backend: emit ────────────────────────────────────────────────────────────
+# Emit mode never scales locally; the main loop calls _emit_state directly
+# each cycle. Dispatchers below handle emit with inline no-ops, so there are
+# no `_emit_get_current_replicas`-style stubs to maintain.
+_emit_state() {
+    local target="$1" current="$2" online="$3" busy="$4" idle_names="$5"
+    local idle_json='[]'
+    if [[ -n "${idle_names}" ]]; then
+        idle_json="$(printf '%s\n' "${idle_names}" \
+            | awk 'NF' \
+            | jq -R . | jq -s . 2>/dev/null || echo '[]')"
+    fi
+    local tmp="${SCALE_EMIT_FILE}.tmp.$$"
+    cat > "${tmp}" <<JSON
+{
+  "ts": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+  "backend": "emit",
+  "target": ${target},
+  "current": ${current},
+  "online": ${online},
+  "busy": ${busy},
+  "idle_runner_names": ${idle_json}
+}
+JSON
+    mv -f "${tmp}" "${SCALE_EMIT_FILE}"
+}
+
+# ── Backend dispatchers ──────────────────────────────────────────────────────
+backend_get_current_replicas() {
+    case "${SCALE_BACKEND}" in
+        compose) _compose_get_current_replicas ;;
+        exec)    _exec_get_current_replicas ;;
+        emit)    echo 0 ;;
+    esac
+}
+
+backend_scale_to() {
+    case "${SCALE_BACKEND}" in
+        compose) _compose_scale_to "$1" ;;
+        exec)    _exec_scale_to "$1" ;;
+        emit)    return 0 ;;
+    esac
+}
+
+# Returns retired count via stdout on success; non-zero exit (with no stdout)
+# means "backend does not support targeted removal; caller should fall back
+# to naive scale_to(target)."
+backend_remove_by_names() {
+    case "${SCALE_BACKEND}" in
+        compose) _compose_remove_by_names "$@" ;;
+        exec)    _exec_remove_by_names "$@" ;;
+        emit)    return 1 ;;
+    esac
+}
+
+# ── Graceful scale-down ──────────────────────────────────────────────────────
+# In ephemeral mode each container handles exactly ONE job and then exits;
+# capacity for concurrent jobs is the replica count. A naive scale-to=N call
+# typically removes replicas in the orchestrator's own index order, NOT by
+# busy/idle state — so it can abort an in-flight job. This function:
+#
+#   1. Asks GitHub which runners are currently online + idle (busy=false).
+#   2. Selects the first `need` idle runner names.
+#   3. Asks the active backend to remove those specific replicas via
+#      `backend_remove_by_names`. Backends signal lack of support by
+#      returning non-zero — in that case we fall back to a naive
+#      `backend_scale_to(target)` which the operator should configure to be
+#      safe for their orchestrator (e.g. `kubectl delete pod` of the picked
+#      pod and let the Deployment reconcile).
+#   4. If no idle runners are available we DO NOT kill busy containers; we
+#      keep the current count and retry next interval. This trades a slower
+#      scale-down for never aborting a user's workflow.
+graceful_scale_down() {
+    local target="$1"
+    local current="$2"
+    local need=$(( current - target ))
+
+    if [[ "${need}" -le 0 ]]; then
+        return 0
+    fi
+
+    log "info" "Graceful scale-down: need to retire ${need} idle replica(s) (target=${target})"
+
+    local idle_names
+    idle_names="$(cached_idle_runner_names)"
+    if [[ -z "${idle_names}" ]]; then
+        log "info" "No idle runners available to retire -- deferring scale-down"
         return 1
     fi
 
-    # Reconcile compose's view. Stopped containers still count as replicas
-    # in `compose ps`; without this step compose would resurrect them on
-    # the next `up` call.
-    local compose_args=(-f "${COMPOSE_FILE}")
-    if [[ -n "${COMPOSE_PROJECT}" ]]; then
-        compose_args+=(-p "${COMPOSE_PROJECT}")
-    fi
-    docker compose "${compose_args[@]}" rm -fsv "${COMPOSE_SERVICE}" >/dev/null 2>&1 || true
+    # Pick the first `need` idle names.
+    local picked=()
+    local name
+    while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        picked+=("${name}")
+        [[ "${#picked[@]}" -ge "${need}" ]] && break
+    done <<< "${idle_names}"
 
-    local new_target=$(( current - retired ))
-    if [[ "${new_target}" -lt "${target}" ]]; then
-        new_target="${target}"
+    if [[ "${#picked[@]}" -eq 0 ]]; then
+        log "info" "No idle runners selectable -- deferring scale-down"
+        return 1
     fi
-    scale_to "${new_target}"
+
+    # Try backend-native targeted removal first.
+    local retired
+    if retired="$(backend_remove_by_names "${picked[@]}")" \
+        && [[ -n "${retired}" ]] && [[ "${retired}" -gt 0 ]]; then
+        local new_target=$(( current - retired ))
+        if [[ "${new_target}" -lt "${target}" ]]; then
+            new_target="${target}"
+        fi
+        backend_scale_to "${new_target}"
+        return 0
+    fi
+
+    log "info" "Backend ${SCALE_BACKEND} does not support targeted removal -- falling back to naive scale_to(${target})"
+    backend_scale_to "${target}"
 }
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 log "info" "═══════════════════════════════════════════════════════"
 log "info" "  GitHub Actions Runner Autoscaler"
 log "info" "═══════════════════════════════════════════════════════"
+log "info" "  Backend      : ${SCALE_BACKEND}"
 log "info" "  Mode         : ${SCALE_MODE}"
 log "info" "  Min replicas : ${SCALE_MIN}"
 log "info" "  Max replicas : ${SCALE_MAX}"
@@ -263,21 +515,42 @@ if [[ "${SCALE_MODE}" == "auto" ]]; then
     log "info" "  Scale-down at: ${SCALE_DOWN_THRESHOLD}% busy"
 fi
 log "info" "  Runner URL   : ${RUNNER_URL}"
-log "info" "  Service      : ${COMPOSE_SERVICE}"
+if [[ -n "${RUNNER_SCOPE_LABELS}" || -n "${RUNNER_SCOPE_NAME_REGEX}" ]]; then
+    log "info" "  Scope labels : ${RUNNER_SCOPE_LABELS:-<none>}"
+    log "info" "  Scope regex  : ${RUNNER_SCOPE_NAME_REGEX:-<none>}"
+else
+    log "info" "  Scope filter : <none> -- counting ALL runners in ${RUNNER_URL}"
+fi
+case "${SCALE_BACKEND}" in
+    compose) log "info" "  Compose svc  : ${COMPOSE_SERVICE} (file: ${COMPOSE_FILE})" ;;
+    exec)    log "info" "  Exec cmd     : ${SCALE_EXEC} (supports_remove=${SCALE_EXEC_SUPPORTS_REMOVE})" ;;
+    emit)    log "info" "  Emit file    : ${SCALE_EMIT_FILE}" ;;
+esac
 log "info" "═══════════════════════════════════════════════════════"
 
-# ── Fixed mode: set to MAX and exit loop ──────────────────────────────────────
+# ── Fixed mode: set to MAX and hold ──────────────────────────────────────────
 if [[ "${SCALE_MODE}" == "fixed" ]]; then
     log "info" "Fixed mode: scaling to SCALE_MAX=${SCALE_MAX} and holding"
-    scale_to "${SCALE_MAX}"
+    backend_scale_to "${SCALE_MAX}"
 
-    # Stay alive and periodically verify the count
     while true; do
         sleep "${SCALE_INTERVAL}"
-        current="$(get_current_replicas)"
+
+        if [[ "${SCALE_BACKEND}" == "emit" ]]; then
+            # Emit mode: publish state every cycle. No replica enforcement.
+            if refresh_runners_cache; then
+                read -r ONLINE BUSY <<< "$(cached_runner_counts)"
+                _emit_state "${SCALE_MAX}" 0 "${ONLINE}" "${BUSY}" "$(cached_idle_runner_names)"
+            else
+                log "warn" "Failed to query runner status, skipping emit cycle"
+            fi
+            continue
+        fi
+
+        current="$(backend_get_current_replicas)"
         if [[ "${current}" -ne "${SCALE_MAX}" ]]; then
             log "warn" "Expected ${SCALE_MAX} replicas but found ${current}, correcting..."
-            scale_to "${SCALE_MAX}"
+            backend_scale_to "${SCALE_MAX}"
         fi
     done
 fi
@@ -285,32 +558,52 @@ fi
 # ── Auto mode: main scaling loop ─────────────────────────────────────────────
 LAST_SCALE_TIME=0
 
-# Ensure minimum runners are up
-scale_to "${SCALE_MIN}"
+# Ensure minimum runners are up (no-op for emit backend).
+backend_scale_to "${SCALE_MIN}"
 
 while true; do
     sleep "${SCALE_INTERVAL}"
 
     NOW="$(date +%s)"
-    CURRENT="$(get_current_replicas)"
 
-    read -r ONLINE BUSY <<< "$(get_runner_counts)" || {
+    if ! refresh_runners_cache; then
         log "warn" "Failed to query runner status, skipping cycle"
         continue
-    }
+    fi
 
+    CURRENT="$(backend_get_current_replicas)"
+    read -r ONLINE BUSY <<< "$(cached_runner_counts)"
     IDLE=$((ONLINE - BUSY))
 
-    # Calculate busy percentage (avoid division by zero)
+    # Calculate busy percentage (avoid division by zero). In emit mode CURRENT
+    # is always 0, so fall back to ONLINE as the denominator so the threshold
+    # logic still produces a sensible target count in the emitted state file.
     if [[ "${CURRENT}" -gt 0 ]]; then
         BUSY_PCT=$(( (BUSY * 100) / CURRENT ))
+    elif [[ "${SCALE_BACKEND}" == "emit" && "${ONLINE}" -gt 0 ]]; then
+        BUSY_PCT=$(( (BUSY * 100) / ONLINE ))
     else
         BUSY_PCT=0
     fi
 
-    log "info" "Status: replicas=${CURRENT} online=${ONLINE} busy=${BUSY} idle=${IDLE} busy%=${BUSY_PCT}%"
+    log "info" "Status: backend=${SCALE_BACKEND} replicas=${CURRENT} online=${ONLINE} busy=${BUSY} idle=${IDLE} busy%=${BUSY_PCT}%"
 
-    # Cooldown check
+    # Emit mode: compute the proposed target using ONLINE (since CURRENT=0)
+    # and publish state every cycle regardless of cooldown. External systems
+    # decide whether to act.
+    if [[ "${SCALE_BACKEND}" == "emit" ]]; then
+        TARGET_FOR_EMIT="${ONLINE}"
+        if [[ "${BUSY_PCT}" -ge "${SCALE_UP_THRESHOLD}" && "${ONLINE}" -lt "${SCALE_MAX}" ]]; then
+            TARGET_FOR_EMIT=$(( ONLINE + 1 ))
+        elif [[ "${BUSY_PCT}" -le "${SCALE_DOWN_THRESHOLD}" && "${ONLINE}" -gt "${SCALE_MIN}" ]]; then
+            TARGET_FOR_EMIT=$(( ONLINE - 1 ))
+        fi
+        TARGET_FOR_EMIT="$(clamp "${TARGET_FOR_EMIT}" "${SCALE_MIN}" "${SCALE_MAX}")"
+        _emit_state "${TARGET_FOR_EMIT}" "${CURRENT}" "${ONLINE}" "${BUSY}" "$(cached_idle_runner_names)"
+        continue
+    fi
+
+    # Cooldown check (skip scaling action, but status was already logged)
     SINCE_LAST=$(( NOW - LAST_SCALE_TIME ))
     if [[ "${SINCE_LAST}" -lt "${SCALE_COOLDOWN}" ]]; then
         continue
@@ -318,9 +611,9 @@ while true; do
 
     # Scale-up: if busy ratio exceeds threshold and we're below MAX
     if [[ "${BUSY_PCT}" -ge "${SCALE_UP_THRESHOLD}" && "${CURRENT}" -lt "${SCALE_MAX}" ]]; then
-        NEW_COUNT=$((CURRENT + 1))
+        NEW_COUNT="$(clamp $((CURRENT + 1)) "${SCALE_MIN}" "${SCALE_MAX}")"
         log "info" "Busy ratio ${BUSY_PCT}% >= ${SCALE_UP_THRESHOLD}% → scaling up to ${NEW_COUNT}"
-        if scale_to "${NEW_COUNT}"; then
+        if backend_scale_to "${NEW_COUNT}"; then
             LAST_SCALE_TIME="${NOW}"
         fi
         continue
@@ -328,11 +621,7 @@ while true; do
 
     # Scale-down: if busy ratio is below threshold and we're above MIN
     if [[ "${BUSY_PCT}" -le "${SCALE_DOWN_THRESHOLD}" && "${CURRENT}" -gt "${SCALE_MIN}" ]]; then
-        NEW_COUNT=$((CURRENT - 1))
-        # Never go below MIN
-        if [[ "${NEW_COUNT}" -lt "${SCALE_MIN}" ]]; then
-            NEW_COUNT="${SCALE_MIN}"
-        fi
+        NEW_COUNT="$(clamp $((CURRENT - 1)) "${SCALE_MIN}" "${SCALE_MAX}")"
         log "info" "Busy ratio ${BUSY_PCT}% <= ${SCALE_DOWN_THRESHOLD}% → graceful scale-down to ${NEW_COUNT}"
         if graceful_scale_down "${NEW_COUNT}" "${CURRENT}"; then
             LAST_SCALE_TIME="${NOW}"

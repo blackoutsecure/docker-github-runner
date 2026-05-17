@@ -58,6 +58,12 @@ RUN chmod +x /tmp/build/*.sh && \
 
 COPY --link root/ /
 
+# Optional autoscaler sidecar entrypoint. Baked in so Balena (no host bind mounts)
+# can use the sidecar pattern. Inert unless invoked via an explicit entrypoint
+# override on a sidecar service; the normal s6 boot path never touches it.
+COPY --link scripts/autoscale.sh /usr/local/bin/gh-runner-autoscale
+RUN chmod 0755 /usr/local/bin/gh-runner-autoscale
+
 ENV HOME="/config" \
     RUNNER_WORKDIR="/config/work" \
     RUNNER_NAME="" \
@@ -98,13 +104,7 @@ RUN chmod +x /tmp/finalize.sh && /tmp/finalize.sh && rm -f /tmp/finalize.sh
 
 VOLUME ["/config"]
 
-# start-period must accommodate the worst-case first boot:
-#  - cross-fs bootstrap copy of the ~460 MB runner tree to a tmpfs (observed
-#    ~155 s on slow ARM hardware in read_only / tmpfs mode)
-#  - paginated GitHub API calls for stale-runner cleanup, runner-group
-#    verification, name deduplication, and config.sh registration
-# 300 s leaves comfortable headroom for slow ARM hardware while no longer
-# masking real registration failures behind a 10-minute window. retries=5
-# tolerates brief api.github.com flakes once the runner is up.
+# 300s start-period covers slow ARM cold-start (large runner tree extraction +
+# API-based registration); retries=5 tolerates brief api.github.com flakes.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=5 \
     CMD /usr/local/bin/gh-runner-healthcheck

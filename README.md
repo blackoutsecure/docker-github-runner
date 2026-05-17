@@ -34,8 +34,8 @@ Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app/).
     - [Docker Compose (recommended)](#docker-compose-recommended)
     - [Ephemeral runners](#ephemeral-runners)
     - [Persistent runner with `/config` volume](#persistent-runner-with-config-volume)
-    - [Multiple runners on one host](#multiple-runners-on-one-host)
-    - [Autoscaling](#autoscaling)
+    - [Recommended: Fixed pool of ephemeral runners](#recommended-fixed-pool-of-ephemeral-runners)
+    - [Advanced: Dynamic scaling](#advanced-dynamic-scaling)
     - [Balena deployment](#balena-deployment)
     - [Docker CLI](#docker-cli)
   - [Parameters](#parameters)
@@ -65,7 +65,6 @@ Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app/).
   - [User / Group Identifiers](#user--group-identifiers)
   - [Application setup notes](#application-setup-notes)
     - [Ephemeral mode and the concurrency model](#ephemeral-mode-and-the-concurrency-model)
-      - [⚠️ IMPORTANT: Ephemeral Mode Does NOT Restart the Entire Box](#️-important-ephemeral-mode-does-not-restart-the-entire-box)
     - [Docker-in-Docker (container-based jobs)](#docker-in-docker-container-based-jobs)
       - [`DOCKER_IN_DOCKER` + LSIO non-root (`--user`)](#docker_in_docker--lsio-non-root---user)
     - [Custom packages / init scripts](#custom-packages--init-scripts)
@@ -106,7 +105,7 @@ docker run -d \
 
 Then `docker logs gh-runner` should show a startup banner ending with `Listening for Jobs`.
 
-For compose, ephemeral, hardened, and autoscaling configurations, see [Usage](#usage).
+For compose, ephemeral, hardened, fixed-pool, and dynamic-scaling configurations, see [Usage](#usage).
 
 ## Image Availability
 
@@ -197,7 +196,7 @@ services:
     restart: always
 ```
 
-> **About `read_only: true`** — the runner writes its registration state (`.runner`, `.credentials`, `_diag/`, `_work/`) into `/opt/runner-bin` directly. A blanket `read_only: true` on the service therefore breaks startup. If you need a hardened filesystem posture, prefer mounting individual writable tmpfs entries for the few writable paths the runner needs (`/opt/runner-bin/_diag`, `/opt/runner-bin/_work`, plus a writable mount strategy for the registration files) and validate on your own infrastructure. Full read-only mode is currently not supported out of the box; track or open an issue if this is important to your deployment.
+> **About `read_only: true`** — the runner writes its registration state into `/opt/runner-bin`, so a blanket `read_only: true` breaks startup. For a hardened posture, rely on `no-new-privileges:true`, `cap_drop: ALL` plus the minimum capability set, and tmpfs for `/run`, `/tmp`, `/var/log`.
 
 ### Persistent runner with `/config` volume
 
@@ -224,9 +223,16 @@ services:
     restart: unless-stopped
 ```
 
-### Multiple runners on one host
+### Recommended: Fixed pool of ephemeral runners
 
-Run several identical runners on the same host using `docker compose --scale`. Each container gets a unique hostname and the runner auto-deduplicates names by appending `-1`, `-2`, … if a matching name is already online.
+For most users — **including everyone on Balena, Kubernetes, Docker Swarm, or any orchestrator that already restarts crashed containers** — the simplest robust pattern is a **fixed-size pool of ephemeral runners**. No external scheduler, no Docker socket on the scaler, no `docker compose` plumbing inside a container.
+
+How it works:
+1. Pick a pool size `N` based on your *peak* concurrent CI demand (start with 2–5; grow as you measure backlog).
+2. Run `N` identical replicas, each with `RUNNER_EPHEMERAL=true`. Each replica accepts exactly one job and exits.
+3. Your orchestrator (`restart: always` on Docker / `restartPolicy: Always` on K8s / Balena's supervisor) immediately re-creates the exited container, which registers as a brand-new runner ready for the next job.
+
+Pool size stays constant; only the individual container per job rotates. Capacity is always `N`.
 
 ```yaml
 services:
@@ -238,6 +244,7 @@ services:
       - GITHUB_PAT=ghp_xxx
       - RUNNER_LABELS=self-hosted
       - RUNNER_EPHEMERAL=true
+      - CLEANUP_OFFLINE_RUNNERS=true   # sweep ghost runners on each (re)start
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     security_opt:
@@ -252,12 +259,69 @@ services:
 docker compose up -d --scale gh-runner=3
 ```
 
-### Autoscaling
+> On Balena, set the pool size with the `replicas` field in your fleet's compose file — no host SSH or `--scale` flag required. On Kubernetes, set `spec.replicas` on the Deployment.
 
-> **Ephemeral and autoscaling are complementary, not contradictory.**
-> Upstream design: an ephemeral runner accepts exactly one job, then exits. Autoscaling in this project means **running multiple ephemeral container replicas** — concurrency comes from the number of replicas, not from anything inside a single container. The `gh-runner-scaler` sidecar adjusts the replica count based on demand. See [Ephemeral mode and the concurrency model](#ephemeral-mode-and-the-concurrency-model) for details.
+**Outgrow this pattern** only when demand is bursty, idle compute cost is material, *and* you accept the operational cost of a scaler — otherwise the fixed pool is the right answer.
 
-The repository ships [`scripts/autoscale.sh`](scripts/autoscale.sh), a small Bash autoscaler that polls the GitHub API and adjusts the replica count of the runner compose service.
+### Advanced: Dynamic scaling
+
+Dynamic scaling here means **varying the count of ephemeral replicas** based on observed busy-ratio. Concurrency comes from the number of replicas, never from anything inside a single container — see [Ephemeral mode and the concurrency model](#ephemeral-mode-and-the-concurrency-model).
+
+The repository ships [`scripts/autoscale.sh`](scripts/autoscale.sh) — a small Bash autoscaler that polls the GitHub API for the busy/online ratio and asks a configurable **backend** to adjust the pool size. The script is baked into the image at `/usr/local/bin/gh-runner-autoscale`, so the sidecar can reuse the same image with no host bind mount of the script.
+
+| `SCALE_BACKEND` | Use it for | What it does |
+| --- | --- | --- |
+| `compose` *(default)* | Plain Docker / Docker Compose hosts | Calls `docker compose --scale gh-runner=N`. Requires `/var/run/docker.sock` and the rendered compose file mounted into the sidecar. |
+| `exec` | Anything you can drive from a shell — Balena, K8s without a controller, Nomad, Swarm, custom orchestrators | Invokes a user-supplied command for `count`, `scale <N>`, and (optionally) `remove <name>...`. Portable to any platform. |
+| `emit` | Read-only "decision-as-a-service" | Writes a JSON state file every interval and **never scales locally**. An external system (GitHub Actions cron, balena-cli from a workstation, Argo/Tekton pipeline, …) consumes the file and applies the scaling action however it likes. |
+
+#### Multiple fleets on one org/repo (arm64 + x64, prod + staging, …)
+
+The autoscaler queries the GitHub API for *all* runners registered to `RUNNER_URL` and computes its busy/idle ratio from that set. If you run more than one fleet against the same org or repo — for example an arm64 pool and an x64 pool, or prod and staging — you **must** scope each sidecar to its own fleet, otherwise the metrics are blended and every fleet gets the wrong scaling decision.
+
+Set either or both filters on the **sidecar** (they don't apply to the runner container itself):
+
+| Env var | Effect |
+| --- | --- |
+| `RUNNER_SCOPE_LABELS` | Comma-separated label set. Only runners whose label set is a **superset** of this list are counted. Case-insensitive. GitHub auto-applies `Linux`/`X64`/`ARM64`/`macOS`, so `ARM64` alone reliably picks the arm64 fleet. |
+| `RUNNER_SCOPE_NAME_REGEX` | jq-flavor (PCRE) regex applied to `.name`. Useful when fleets share labels but use distinct name prefixes (e.g. `^arm-runner-`). AND-combined with the label filter. |
+
+Example — two sidecars, one per fleet:
+
+```yaml
+  gh-runner-scaler-arm64:
+    image: blackoutsecure/github-runner:latest
+    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    environment:
+      - RUNNER_URL=https://github.com/MY-ORG
+      - GITHUB_PAT=ghp_xxx
+      - SCALE_BACKEND=exec
+      - SCALE_EXEC=/usr/local/bin/balena-pool-arm64.sh
+      - SCALE_MIN=1
+      - SCALE_MAX=10
+      - RUNNER_SCOPE_LABELS=self-hosted,arm64
+      # OR: RUNNER_SCOPE_NAME_REGEX=^arm-runner-
+    restart: always
+
+  gh-runner-scaler-x64:
+    image: blackoutsecure/github-runner:latest
+    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    environment:
+      - RUNNER_URL=https://github.com/MY-ORG
+      - GITHUB_PAT=ghp_xxx
+      - SCALE_BACKEND=exec
+      - SCALE_EXEC=/usr/local/bin/balena-pool-x64.sh
+      - SCALE_MIN=1
+      - SCALE_MAX=10
+      - RUNNER_SCOPE_LABELS=self-hosted,x64
+    restart: always
+```
+
+When no scope filter is set the sidecar logs `Scope filter : <none> -- counting ALL runners in <RUNNER_URL>` at startup so it's obvious when this is unintentional.
+
+The stale-runner cleanup in the runner container has its own scoping knob, [`CLEANUP_OFFLINE_NAME_REGEX`](#stale-offline-runner-cleanup), which serves the same purpose for the DELETE-on-startup sweep.
+
+#### Compose backend (default)
 
 ```yaml
 services:
@@ -278,11 +342,12 @@ services:
     restart: always
 
   gh-runner-scaler:
-    image: docker.io/docker/compose:latest
-    entrypoint: ["/bin/bash", "/scripts/autoscale.sh"]
+    image: blackoutsecure/github-runner:latest
+    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
     environment:
       - RUNNER_URL=https://github.com/OWNER/REPO
       - GITHUB_PAT=ghp_xxx
+      - SCALE_BACKEND=compose
       - SCALE_MIN=1
       - SCALE_MAX=5
       - SCALE_MODE=auto           # auto | fixed
@@ -293,7 +358,8 @@ services:
       - COMPOSE_SERVICE=gh-runner
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./scripts:/scripts:ro
+      - ./docker-compose.yml:/workspace/docker-compose.yml:ro
+    working_dir: /workspace
     restart: always
     depends_on:
       - gh-runner
@@ -306,7 +372,100 @@ services:
 
 For a static replica count without the sidecar, just use `docker compose up -d --scale gh-runner=N`.
 
-**Graceful scale-down (ephemeral mode):** to avoid aborting an in-flight workflow, the autoscaler queries the GitHub API for runners that are `online` AND `busy=false`, maps each idle runner name back to its local container (by hostname / container ID prefix), and `docker stop`s only those. The s6 finish hook then runs a clean `config.sh remove`. If no idle runners are available, the autoscaler **defers** scale-in to the next interval rather than killing a busy container.
+**Graceful scale-down (ephemeral mode):** to avoid aborting an in-flight workflow, the autoscaler queries the GitHub API for runners that are `online` AND `busy=false`, picks the idle ones, and asks the backend to stop only those. If no idle runners are available, the autoscaler **defers** scale-in to the next interval rather than killing a busy container. With `SCALE_BACKEND=compose` this is implemented via per-container `docker stop`; with `SCALE_BACKEND=exec` you opt in by setting `SCALE_EXEC_SUPPORTS_REMOVE=true` and implementing the `remove <name>...` verb in your wrapper.
+
+#### Exec backend (orchestrator-agnostic)
+
+Set `SCALE_BACKEND=exec` and point `SCALE_EXEC` at a script. The autoscaler invokes it with one of three verbs:
+
+| Verb | Required | Stdout contract |
+| --- | --- | --- |
+| `count`                | yes  | Print the current replica count as a non-negative integer, then exit `0`. |
+| `scale <N>`            | yes  | Bring the pool to exactly `N` replicas. Exit `0` on success. |
+| `remove <name>...`     | optional (gated by `SCALE_EXEC_SUPPORTS_REMOVE=true`) | Retire the specifically-named runners. Exit `0` on success. If you omit this verb, the autoscaler falls back to a naive `scale <new_total>`. |
+
+Minimal Balena wrapper using `balena-cli` (run the sidecar somewhere with a Balena API token in `$BALENA_TOKEN`):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+FLEET="my-org/runner-fleet"
+SERVICE="gh-runner"
+case "$1" in
+  count)
+    balena devices --fleet "$FLEET" --json \
+      | jq "[ .[] | select(.is_online and .status == \"Idle\") ] | length"
+    ;;
+  scale)
+    # Update the fleet's compose service replica count via balena-cli
+    balena env add --fleet "$FLEET" "${SERVICE^^}_REPLICAS" "$2"
+    ;;
+  remove)
+    # Optional: implement targeted device retirement here, then exit 0
+    exit 1
+    ;;
+esac
+```
+
+```yaml
+  gh-runner-scaler:
+    image: blackoutsecure/github-runner:latest
+    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    environment:
+      - RUNNER_URL=https://github.com/MY-ORG
+      - GITHUB_PAT=ghp_xxx
+      - BALENA_TOKEN=...
+      - SCALE_BACKEND=exec
+      - SCALE_EXEC=/usr/local/bin/balena-pool.sh
+      - SCALE_MIN=1
+      - SCALE_MAX=10
+    volumes:
+      - ./balena-pool.sh:/usr/local/bin/balena-pool.sh:ro
+    restart: always
+```
+
+The same shape works for `kubectl scale deployment/gh-runner --replicas=N`, `nomad job scale gh-runner N`, `docker service scale gh-runner=N`, etc.
+
+#### Emit backend (read-only / external scheduler)
+
+When you want the autoscaler to *recommend* a target replica count but not act on it — for example to keep all scaling actions in a GitHub Actions workflow that already has org-admin credentials — use `SCALE_BACKEND=emit`. The script writes one JSON object to `SCALE_EMIT_FILE` each interval:
+
+```json
+{
+  "ts": "2026-05-17T13:30:33Z",
+  "backend": "emit",
+  "target": 5,
+  "current": 0,
+  "online": 4,
+  "busy": 3,
+  "idle_runner_names": ["runner-aaa", "runner-bbb"]
+}
+```
+
+```yaml
+  gh-runner-scaler:
+    image: blackoutsecure/github-runner:latest
+    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    environment:
+      - RUNNER_URL=https://github.com/MY-ORG
+      - GITHUB_PAT=ghp_xxx
+      - SCALE_BACKEND=emit
+      - SCALE_EMIT_FILE=/shared/scale-state.json
+      - SCALE_MIN=1
+      - SCALE_MAX=10
+    volumes:
+      - scaler-state:/shared
+    restart: always
+
+volumes:
+  scaler-state:
+```
+
+An external scheduler (cron + `balena-cli`, GitHub Actions, Argo, …) reads `target` from the file and applies it however that environment expects. This is the most portable option — the autoscaler is fully decoupled from your scaling primitive.
+
+#### Kubernetes
+
+For Kubernetes the recommended approach is the **fixed pool** above (Deployment with `replicas: N` and `RUNNER_EPHEMERAL=true`). If you need true demand-driven scaling, prefer GitHub's own [Actions Runner Controller (ARC)](https://github.com/actions/actions-runner-controller) which integrates natively with the cluster autoscaler and HPA — the bash autoscaler in this repo is intended for non-K8s environments.
 
 ### Balena deployment
 
@@ -437,10 +596,13 @@ See [Stale offline runner cleanup](#stale-offline-runner-cleanup) for the full d
 
 ### Autoscaler variables
 
-Used by the `gh-runner-scaler` sidecar service (see [Autoscaling](#autoscaling)):
+Used by the `gh-runner-scaler` sidecar service (see [Advanced: Dynamic scaling](#advanced-dynamic-scaling)):
+
+**Common to all backends:**
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `SCALE_BACKEND` | `compose` | Scaling backend: `compose` \| `exec` \| `emit` |
 | `SCALE_MIN` | `1` | Minimum runners to keep alive |
 | `SCALE_MAX` | `1` | Maximum runners allowed |
 | `SCALE_MODE` | `auto` | `auto` = scale on demand, `fixed` = always run `SCALE_MAX` |
@@ -448,9 +610,27 @@ Used by the `gh-runner-scaler` sidecar service (see [Autoscaling](#autoscaling))
 | `SCALE_COOLDOWN` | `60` | Seconds between scale events |
 | `SCALE_UP_THRESHOLD` | `80` | Scale up when ≥N% of runners are busy |
 | `SCALE_DOWN_THRESHOLD` | `20` | Scale down when ≤N% of runners are busy |
+
+**Compose backend (`SCALE_BACKEND=compose`):**
+
+| Variable | Default | Description |
+| --- | --- | --- |
 | `COMPOSE_SERVICE` | `gh-runner` | Name of the runner compose service to scale |
 | `COMPOSE_PROJECT` | _empty_ | Optional compose project name |
 | `COMPOSE_FILE` | `docker-compose.yml` | Compose file path (mount it into the scaler) |
+
+**Exec backend (`SCALE_BACKEND=exec`):**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SCALE_EXEC` | _required_ | Path or shell command invoked with verbs `count`, `scale <N>`, and (optionally) `remove <name>...` |
+| `SCALE_EXEC_SUPPORTS_REMOVE` | `false` | Set `true` if your wrapper implements the `remove <name>...` verb for targeted graceful scale-down |
+
+**Emit backend (`SCALE_BACKEND=emit`):**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SCALE_EMIT_FILE` | _required_ | Path to write the JSON state file each interval |
 
 ### Volumes
 
@@ -678,30 +858,14 @@ LSIO non-root mode (`user: "911:911"`) is supported on a best-effort basis — s
 
 ### Ephemeral mode and the concurrency model
 
-#### ⚠️ IMPORTANT: Ephemeral Mode Does NOT Restart the Entire Box
+`RUNNER_EPHEMERAL=true` makes the upstream `Runner.Listener` single-shot: each container picks up exactly **one job**, runs it, and exits. With `restart: always` the container is re-created and registers as a brand-new runner. There is no upstream knob for "N jobs per listener" in ephemeral mode — this is how `--ephemeral` is defined by GitHub.
 
-**Ephemeral only restarts the individual CONTAINER (runner), not the entire Balena device or box.**
-
-- When a job finishes, that ONE runner **container** exits.
-- Docker automatically restarts ONLY THAT container (via `restart: always`).
-- **The entire device/box stays up and running** — no box restart, no shutdown.
-- All other containers and services continue running normally.
-- Only that specific runner container is recreated for the next job.
-
-**This is crucial:** Ephemeral is safe for multi-container environments. It does NOT disrupt other services or jobs.
-
----
-
-`RUNNER_EPHEMERAL=true` makes the upstream `Runner.Listener` single-shot: each container picks up exactly **one job**, runs it, and exits. With `restart: always` the container is then re-created and registers as a brand-new runner. There is **no upstream knob for "N jobs per listener"** in ephemeral mode — this is how `--ephemeral` is defined by GitHub.
-
-> **One ephemeral container = capacity for one concurrent job.**
-> Concurrency on a host comes from running **multiple replicas**, not from anything inside a single container.
-> **Each replica is independent — one replica exiting does NOT affect other replicas or the host.**
+> **One ephemeral container = capacity for one concurrent job.** Concurrency on a host comes from running **multiple replicas**; only the exited container is recreated, not the host or other services.
 
 If you need *N* jobs to run at the same time:
 
 - Use `docker compose up -d --scale gh-runner=N`, or
-- Run the `gh-runner-scaler` sidecar with `SCALE_MAX=N` (see [Autoscaling](#autoscaling)).
+- Run the `gh-runner-scaler` sidecar with `SCALE_MAX=N` (see [Advanced: Dynamic scaling](#advanced-dynamic-scaling)).
 
 If you need persistent multi-job capacity from a single container, drop `RUNNER_EPHEMERAL=true` — the listener will then accept back-to-back jobs serially (still only one at a time, by upstream design).
 

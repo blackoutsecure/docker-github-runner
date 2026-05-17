@@ -50,4 +50,5 @@ tmp/
 # Ensure root overlay, build scripts, and Dockerfile context are included
 !root/
 !build/
+!scripts/
 !Dockerfile

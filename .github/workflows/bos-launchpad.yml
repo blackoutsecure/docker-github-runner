@@ -58,6 +58,13 @@ jobs:
       security-events: write   # nested Docker Scout SARIF upload
     uses: blackoutsecure/bos-automation-hub/.github/workflows/bos-launchpad.yml@main
     with:
+      # ── Stage toggles ────────────────────────────────────────────
+      # Every launchpad stage defaults to `false`. Explicit opt-in so
+      # the hub can grow new stages without quietly enabling them here.
+      docker:         true
+      balena:         true
+      github_release: true
+
       upstream_repo:    actions/runner
       track_file:       .github/upstream/actions-runner.json
       # Push events should always rebuild; schedule only when upstream moves.
@@ -65,7 +72,7 @@ jobs:
 
       image_name:          github-runner
       dockerhub_namespace: ${{ vars.DOCKERHUB_NAMESPACE }}
-      block_name:          github-runner
+      # `block_name` defaults to `image_name` ("github-runner") when omitted.
       balena_namespace:    ${{ vars.BALENA_NAMESPACE }}
 
       # Render balena.yml dynamically — no checked-in copy.

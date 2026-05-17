@@ -1,13 +1,10 @@
 #!/usr/bin/with-contenv bash
 # shellcheck shell=bash
 #
-# Optional one-shot init: install extra apt packages and/or run a
-# user-supplied shell script BEFORE the runner service starts.
-#
-# Runs as root (s6 init sequence). The runner service itself still drops
-# to the LSIO `abc` user (uid 911) via s6-setuidgid afterwards.
-#
-# This step is a no-op when none of the trigger variables are set.
+# Optional one-shot init: install extra apt packages and/or run a user-supplied
+# shell script BEFORE the runner service starts. Runs as root; the runner
+# service drops to the LSIO `abc` user (uid 911) afterwards. No-op when none
+# of EXTRA_PACKAGES / EXTRA_APT_REPOS / EXTRA_INIT_SCRIPT are set.
 #
 # Variables:
 #   EXTRA_APT_REPOS   Semicolon-separated apt repository lines added to
@@ -17,11 +14,8 @@
 #   EXTRA_INIT_SCRIPT Path to a shell script (typically bind-mounted RO)
 #                     run with `set -e` after package installation.
 #
-# Incompatible with read-only rootfs (apt needs to write). Aborts with a
-# clear error if the rootfs is read-only and EXTRA_PACKAGES is set.
-#
-# For repeated use, build a custom image (FROM blackoutsecure/github-runner)
-# instead of reinstalling on every container start.
+# Incompatible with read-only rootfs (apt needs to write). For repeated use,
+# build a custom image (FROM blackoutsecure/github-runner) instead.
 #
 set -uo pipefail
 
@@ -29,18 +23,15 @@ set -uo pipefail
 . /usr/local/bin/log-functions.sh
 LOG_TAG="init-custom"
 
-# Normalize: trim whitespace and treat whitespace-only values as unset.
-# Prevents accidentally enabling the step with a value like "   " (e.g.
-# from a stripped-out compose template).
+# Normalize: trim whitespace and treat whitespace-only values as unset, so a
+# stripped-out compose template like "   " doesn't accidentally enable us.
 _strip() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "${s}"; }
 EXTRA_PACKAGES="$(_strip "${EXTRA_PACKAGES:-}")"
 EXTRA_APT_REPOS="$(_strip "${EXTRA_APT_REPOS:-}")"
 EXTRA_INIT_SCRIPT="$(_strip "${EXTRA_INIT_SCRIPT:-}")"
 
-# Fast-path: nothing to do -- no triggers configured. We deliberately exit
-# WITHOUT running any apt operations or sourcing any user files when all
-# three variables are empty/unset, so a default deployment cannot be
-# tricked into running unexpected code via this hook.
+# Fast-path: nothing to do. Exit before any apt or user-script work so the
+# default deployment can't be tricked into running unexpected code here.
 if [[ -z "${EXTRA_PACKAGES}" && -z "${EXTRA_APT_REPOS}" && -z "${EXTRA_INIT_SCRIPT}" ]]; then
     log "debug" "init-custom: no EXTRA_* triggers set, skipping (no-op)"
     exit 0
@@ -57,9 +48,9 @@ if [[ -n "${EXTRA_APT_REPOS}" && -z "${EXTRA_PACKAGES}" ]]; then
     fi
 fi
 
-# LSIO non-root mode (https://docs.linuxserver.io/misc/non-root/) -- when the
-# container is started with `--user <uid>:<gid>`, init no longer runs as root,
-# so apt and arbitrary EXTRA_INIT_SCRIPT actions cannot be performed.
+# LSIO non-root mode (https://docs.linuxserver.io/misc/non-root/): with
+# `--user <uid>:<gid>` init runs unprivileged, so apt/EXTRA_INIT_SCRIPT
+# root actions cannot be performed.
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${EXTRA_PACKAGES:-}" || -n "${EXTRA_APT_REPOS:-}" ]]; then
         log "warn" "Container is running as non-root (--user) -- EXTRA_PACKAGES/EXTRA_APT_REPOS are ignored"
@@ -90,7 +81,6 @@ fi
 if [[ -n "${EXTRA_APT_REPOS:-}" ]]; then
     log "info" "Adding extra apt repositories"
     : > /etc/apt/sources.list.d/extra.list
-    # Split on ';' -- each entry is a full apt sources line
     IFS=';' read -ra _repos <<< "${EXTRA_APT_REPOS}"
     for repo in "${_repos[@]}"; do
         repo="$(echo "${repo}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -104,8 +94,8 @@ fi
 # Optional: install extra apt packages
 # ---------------------------------------------------------------------------
 if [[ -n "${EXTRA_PACKAGES:-}" ]]; then
-    # Validate each package name against a strict whitelist so that an
-    # attacker-controlled EXTRA_PACKAGES cannot inject shell commands.
+    # Strict whitelist so an attacker-controlled EXTRA_PACKAGES cannot inject
+    # shell commands.
     PKG_RE='^[a-z0-9][a-z0-9+.\-]+$'
     declare -a _safe_pkgs=()
     for pkg in ${EXTRA_PACKAGES}; do
@@ -152,9 +142,9 @@ if [[ -n "${EXTRA_INIT_SCRIPT:-}" ]]; then
         exit 1
     fi
 
-    # Security: refuse to execute world-writable scripts. Anyone with shell
-    # access to a writable mount could otherwise pivot to root in the
-    # container by editing the script between starts.
+    # Refuse world-writable scripts: anyone with shell access to a writable
+    # mount could otherwise pivot to root in the container by editing the
+    # script between starts.
     _perms="$(stat -c '%a' "${EXTRA_INIT_SCRIPT}" 2>/dev/null || echo 000)"
     if [[ "${_perms: -1}" =~ [2367] ]]; then
         log "fatal" "EXTRA_INIT_SCRIPT '${EXTRA_INIT_SCRIPT}' is world-writable (mode ${_perms}); refusing to execute"

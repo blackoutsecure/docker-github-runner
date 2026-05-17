@@ -87,12 +87,26 @@ app_setup_block: |
   - Organization: Settings > Actions > Runners > New runner
   - API: `curl -X POST -H "Authorization: token GITHUB_PAT" https://api.github.com/repos/OWNER/REPO/actions/runners/registration-token`
 
-  **Ephemeral Mode + Autoscaling (complementary, not contradictory)**: Set
-  `RUNNER_EPHEMERAL=true` to make the upstream runner accept exactly one job,
-  run it, and exit. Concurrency on the host comes from running multiple
-  container replicas — either via `docker compose up -d --scale gh-runner=N`
-  or via the `gh-runner-scaler` sidecar in `docker-compose.yml`, which polls
-  the GitHub API and scales the replica count based on busy/online ratio.
+  **Ephemeral mode + scaling**: Set `RUNNER_EPHEMERAL=true` to make the upstream
+  runner accept exactly one job, run it, and exit. Host concurrency comes from
+  running multiple replicas. Two patterns are supported:
+
+  - **Fixed pool (recommended)** — `docker compose up -d --scale gh-runner=N`
+    plus `restart: always`. Capacity is constant; exited containers are
+    recreated automatically. Works identically on plain Docker, Swarm,
+    Kubernetes, and Balena — no scaler container needed.
+  - **Dynamic scaling (advanced)** — run the same image as a `gh-runner-scaler`
+    sidecar with `entrypoint: ["/usr/local/bin/gh-runner-autoscale"]`. The
+    scaler polls the GitHub API for the busy/online ratio and asks a
+    configurable `SCALE_BACKEND` to adjust the pool size:
+      - `compose` *(default)* — calls `docker compose --scale`. Plain Docker hosts.
+      - `exec`              — invokes a user-supplied wrapper (`count`/`scale`/`remove` verbs). Portable to Balena CLI, kubectl, Nomad, etc.
+      - `emit`              — read-only mode that writes a JSON state file each interval for an external scheduler to consume.
+    If you run more than one fleet against the same org/repo (e.g. arm64 + x64),
+    scope each sidecar to its own fleet with `RUNNER_SCOPE_LABELS` (subset
+    match, case-insensitive) and/or `RUNNER_SCOPE_NAME_REGEX` — otherwise the
+    autoscaler blends every fleet's metrics and makes the wrong decision.
+    See the Advanced: Dynamic scaling section of the README for the full env-var reference.
 
   **Docker-in-Docker**: Mount the Docker socket (`/var/run/docker.sock`) and
   set `DOCKER_IN_DOCKER=true` to enable container-based GitHub Actions (e.g.
@@ -107,31 +121,28 @@ app_setup_block: |
   `ON_OFFLINE_ACTION` (default: restart the s6 service). Container restart
   policies (`restart: always`) handle the rest.
 
-  **Stale Offline Runner Cleanup**: Crashes, SIGKILL, host reboots, and ephemeral
+  **Stale offline runner cleanup**: Crashes, SIGKILL, host reboots, and ephemeral
   job exits all leave a runner registered as `offline` in GitHub. Set
   `CLEANUP_OFFLINE_RUNNERS=true` (and provide a `GITHUB_PAT`/`GITHUB_TOKEN`) to
-  have the container DELETE offline runners via the API at startup. By default
+  have the container DELETE offline runners via the API at startup.
   `CLEANUP_OFFLINE_IMMEDIATE` auto-resolves to `true` when `RUNNER_EPHEMERAL=true`
-  (offline ephemeral runners are dead by definition, so no grace timer is
-  needed) and `false` otherwise (persistent runners get a `CLEANUP_OFFLINE_AFTER`
-  grace window — default 24 h — so a network blip can't trigger removal). The
-  runner this container is about to register is always skipped, and
-  `CLEANUP_OFFLINE_MAX` (default 25) caps removals per sweep. Use
-  `CLEANUP_OFFLINE_DRY_RUN=true` for the first deploy to preview what would be
-  removed.
+  and `false` otherwise (persistent runners get a `CLEANUP_OFFLINE_AFTER` grace
+  window, default 24 h). The runner this container is about to register is
+  always skipped; `CLEANUP_OFFLINE_MAX` (default 25) caps removals per sweep.
+  Use `CLEANUP_OFFLINE_DRY_RUN=true` to preview the first sweep.
+
+  **Read-only rootfs**: `read_only: true` is not supported out of the box (the
+  runner writes registration state to `/opt/runner-bin`). For a hardened posture
+  rely on `no-new-privileges:true`, `cap_drop: ALL` plus the minimum capability
+  set, and tmpfs for `/run`, `/tmp`, `/var/log`.
 
   **Filesystem layout**: The runner runs directly out of `/opt/runner-bin`,
   which is the directory `config.sh` / `run.sh` write `.runner`,
   `.credentials`, `_diag/`, and `_work/` into. Do **not** mount a tmpfs or
   volume on top of `/opt/runner-bin` — the registration state lives there.
 
-  **Read-only rootfs**: A blanket `read_only: true` on the container is not
-  supported out of the box (the runner needs to write its registration state
-  to `/opt/runner-bin`). Use `no-new-privileges:true`, `cap_drop: ALL`, and
-  the minimum capability set for defense-in-depth instead.
-
-  **Balena Deployment**: This image supports deployment to Balena-powered IoT and edge
-  devices using `balena push <your-app-slug>`. See the `balena.yml` file and
+  **Balena deployment**: This image supports deployment to Balena-powered IoT and
+  edge devices using `balena push <your-app-slug>`. See the `balena.yml` file and
   [Balena documentation](https://docs.balena.io/) for details.
 
 # hardware acceleration
