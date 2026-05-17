@@ -1,25 +1,12 @@
-# Single consumer-side workflow for docker-github-runner. Pure caller for
-# the hub's `bos-launchpad.yml` (Blackout Secure Launchpad) reusable
-# meta-workflow.
+# Caller for the hub's `bos-launchpad.yml` (Blackout Secure Launchpad) reusable.
 #
 #   monitor (github_release mode → actions/runner) → release (docker → balena → github release)
 #
 # Required vars:    DOCKERHUB_NAMESPACE, BALENA_NAMESPACE
 # Required secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, BALENA_API_TOKEN
 #
-# `balena.yml` is NOT checked in; the hub renders it on each run from the
-# `balena_*` inputs below. See blackoutsecure/bos-automation-hub for the
-# full input reference.
-#
-# Private-repo notes
-# ------------------
-# 1. The hub repo `blackoutsecure/bos-automation-hub` must be set to
-#    "Accessible from repositories in the 'blackoutsecure' organization"
-#    under Settings → Actions → General → Access. Without that, the
-#    `uses:` line below fails with `workflow was not found`.
-# 2. The upstream `actions/runner` is public, so no `UPSTREAM_TOKEN` is
-#    needed. If the launchpad ever points at a private upstream, add the
-#    secret to the `secrets:` block below.
+# `balena.yml` is rendered by the hub on each run from the `balena_*` inputs
+# below. See blackoutsecure/bos-automation-hub for the full input reference.
 name: Blackout Secure Launchpad
 
 on:
@@ -39,10 +26,33 @@ on:
       - '.github/workflows/bos-launchpad.yml'
   workflow_dispatch:
     inputs:
-      force_release:
-        description: Run the pipeline even if upstream is unchanged.
+      stage_docker:
+        description: 'Stage: docker build & push'
+        type: boolean
+        default: true
+      stage_balena:
+        description: 'Stage: balena block publish'
+        type: boolean
+        default: true
+      stage_github_release:
+        description: 'Stage: GitHub Release publish'
+        type: boolean
+        default: true
+      # Push events always rebuild via the `with: force_run:`
+      # expression below; this checkbox only affects on-demand
+      # `workflow_dispatch` runs.
+      force_run:
+        description: 'Force: run pipeline even if upstream unchanged'
         type: boolean
         default: false
+      # `auto` lets the hub decide prerelease from the SemVer suffix.
+      # `'true'`/`'false'` force the flag. Ignored unless
+      # `stage_github_release` is on.
+      release_prerelease:
+        description: 'Release: prerelease flag (only for stage_github_release)'
+        type: choice
+        options: [auto, 'true', 'false']
+        default: auto
 
 # No top-level `concurrency:` — the hub workflow owns serialization.
 # Declaring it on both sides triggers a GHA self-deadlock.
@@ -58,21 +68,20 @@ jobs:
       security-events: write   # nested Docker Scout SARIF upload
     uses: blackoutsecure/bos-automation-hub/.github/workflows/bos-launchpad.yml@main
     with:
-      # ── Stage toggles ────────────────────────────────────────────
-      # Every launchpad stage defaults to `false`. Explicit opt-in so
-      # the hub can grow new stages without quietly enabling them here.
-      docker:         true
-      balena:         true
-      github_release: true
+      # Schedule + push runs use the defaults; manual runs honour the
+      # dispatch checkboxes. Every launchpad stage defaults to `false`
+      # in the hub — opt in explicitly.
+      docker:         ${{ github.event_name != 'workflow_dispatch' || inputs.stage_docker }}
+      balena:         ${{ github.event_name != 'workflow_dispatch' || inputs.stage_balena }}
+      github_release: ${{ github.event_name != 'workflow_dispatch' || inputs.stage_github_release }}
 
       upstream_repo:    actions/runner
       track_file:       .github/upstream/actions-runner.json
-      # Push events should always rebuild; schedule only when upstream moves.
-      force_release:    ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_release) }}
+      # Push always rebuilds; schedule only when upstream moves.
+      force_run:        ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_run) }}
 
       image_name:          github-runner
       dockerhub_namespace: ${{ vars.DOCKERHUB_NAMESPACE }}
-      # `block_name` defaults to `image_name` ("github-runner") when omitted.
       balena_namespace:    ${{ vars.BALENA_NAMESPACE }}
 
       # Render balena.yml dynamically — no checked-in copy.
@@ -119,6 +128,11 @@ jobs:
 
         Repository: https://github.com/${{ github.repository }}
         Upstream application: https://github.com/actions/runner
+
+      # `release_prerelease`: `auto` collapses to empty (hub decides from
+      # the SemVer suffix); `'true'`/`'false'` force the flag. Collapses
+      # to `''` outside `workflow_dispatch`.
+      release_prerelease: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_prerelease != 'auto') && inputs.release_prerelease || '' }}
     secrets:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
