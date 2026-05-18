@@ -50,7 +50,9 @@ COPY --link build/ /tmp/build/
 RUN chmod +x /tmp/build/*.sh && \
     /tmp/build/install-runner.sh && \
     rm -rf /tmp/build && \
-    mkdir -p /tmp && chmod 1777 /tmp && \
+    mkdir -p /tmp /scaler && \
+    chmod 1777 /tmp && \
+    chmod 0700 /scaler && \
     cd /opt/runner-bin && \
     ./bin/installdependencies.sh && \
     apt-get clean && \
