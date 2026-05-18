@@ -59,6 +59,7 @@ jobs:
   release:
     permissions:
       contents:        write   # monitor tracking-file commit + GitHub Release publish
+      actions:         write   # nested monitor declares this for `gh workflow run` (validated at workflow-call time)
       pull-requests:   write   # nested Docker Scout PR annotations
       security-events: write   # nested Docker Scout SARIF upload
     uses: blackoutsecure/bos-automation-hub/.github/workflows/bos-launchpad.yml@main
