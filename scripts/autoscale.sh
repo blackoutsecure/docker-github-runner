@@ -187,10 +187,10 @@ case "${SCALE_BACKEND}" in
             log "fatal" "SCALE_BACKEND=emit requires SCALE_EMIT_FILE=<path>"
             exit 1
         fi
-        # Ensure the emit file's parent dir exists. On Balena/balena-engine
-        # (verified May 2026), tmpfs mount targets are NOT auto-created if
-        # the path doesn't already exist in the image filesystem — the mount
-        # silently fails to materialize and every write hits:
+        # Ensure the emit file's parent dir exists. On Balena/balena-engine,
+        # tmpfs mount targets are NOT auto-created if the path doesn't
+        # already exist in the image filesystem — the mount silently fails
+        # to materialize and every write hits:
         #   line N: <path>.tmp.<pid>: No such file or directory
         # The Dockerfile pre-creates the default /scaler mountpoint, but a
         # caller-supplied SCALE_EMIT_FILE pointing elsewhere needs the same

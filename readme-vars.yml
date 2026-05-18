@@ -96,9 +96,11 @@ app_setup_block: |
     recreated automatically. Works identically on plain Docker, Swarm,
     Kubernetes, and Balena — no scaler container needed.
   - **Dynamic scaling (advanced)** — run the same image as a `gh-runner-scaler`
-    sidecar with `entrypoint: ["/usr/local/bin/gh-runner-autoscale"]`. The
-    scaler polls the GitHub API for the busy/online ratio and asks a
-    configurable `SCALE_BACKEND` to adjust the pool size:
+    sidecar with `RUNNER_ROLE=autoscaler` (or pass `autoscaler` as the
+    command argument, or override `entrypoint:` — all three forms produce
+    an identical container). The scaler polls the GitHub API for the
+    busy/online ratio and asks a configurable `SCALE_BACKEND` to adjust
+    the pool size:
       - `compose` *(default)* — calls `docker compose --scale`. Plain Docker hosts.
       - `exec`              — invokes a user-supplied wrapper (`count`/`scale`/`remove` verbs). Portable to Balena CLI, kubectl, Nomad, etc.
       - `emit`              — read-only mode that writes a JSON state file each interval for an external scheduler to consume.

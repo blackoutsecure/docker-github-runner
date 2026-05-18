@@ -85,14 +85,10 @@ jobs:
 
       image_name:          github-runner
       dockerhub_namespace: ${{ vars.DOCKERHUB_NAMESPACE }}
-      # Sidecar autoscaler image built from the `autoscaler` Dockerfile stage
-      # and published to Docker Hub alongside the main runner image. Requires
-      # bos-automation-hub support for companion_* inputs (added in the hub's
-      # bos-launchpad/release reusable workflows).
-      companion_docker:                   true
-      companion_image_name:               github-runner-autoscaler
-      companion_build_target:             autoscaler
-      companion_docker_short_description: GitHub Actions runner autoscaler sidecar image
+      # The autoscaler ships in the same image as the runner — sidecar role is
+      # selected at deploy time via `RUNNER_ROLE=autoscaler` (or the
+      # `autoscaler` command argument, or an explicit `entrypoint:` override).
+      # No `companion_*` inputs are needed; we publish exactly one image.
       balena_namespace:    ${{ vars.BALENA_NAMESPACE }}
 
       # Render balena.yml dynamically — no checked-in copy.

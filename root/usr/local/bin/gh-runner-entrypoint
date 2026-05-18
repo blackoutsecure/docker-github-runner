@@ -1,0 +1,92 @@
+#!/bin/bash
+# shellcheck shell=bash
+# =============================================================================
+# gh-runner-entrypoint — dual-role dispatcher for blackoutsecure/github-runner
+#
+# The same multi-arch image serves two distinct roles:
+#
+#   - "runner"     — full GitHub Actions self-hosted runner under s6-overlay
+#                    (default — preserves the LSIO baseimage's `/init` flow,
+#                    so `init-custom`, PUID/PGID, Docker Mods, healthcheck,
+#                    and all svc-* services run normally).
+#
+#   - "autoscaler" — single-process bash loop that polls the GitHub API and
+#                    asks a pluggable backend to scale the runner pool. Skips
+#                    s6 entirely (sidecar is intentionally minimal).
+#
+# Role selection precedence (first match wins):
+#
+#   1. First CLI argument, when it matches a known role keyword. The arg is
+#      then SHIFTED out so the remainder of "$@" forwards cleanly:
+#          docker run --rm IMAGE autoscaler
+#          docker run --rm IMAGE runner
+#      Synonyms for ergonomics: autoscale|scaler|scale -> autoscaler.
+#
+#   2. RUNNER_ROLE env var:
+#          docker run -e RUNNER_ROLE=autoscaler ... IMAGE
+#      This is the ergonomic option for orchestrators where overriding the
+#      Docker ENTRYPOINT/CMD is awkward (Balena fleet env vars, Kubernetes
+#      Deployment env, Nomad task env, ECS task definitions, …) — set ONE
+#      fleet/workload variable and pull the unchanged image.
+#
+#   3. Default: "runner". Backwards-compatible with every existing user that
+#      pulls this image expecting the standard self-hosted runner behavior.
+#
+# Explicit `entrypoint:` overrides (e.g. `entrypoint: ["/usr/local/bin/gh-runner-autoscale"]`)
+# bypass this wrapper entirely and continue to work — Docker's `entrypoint:`
+# in compose REPLACES the image ENTRYPOINT, not augments it. Existing
+# deployments that already used the explicit-override pattern keep working.
+#
+# Pass-through commands (e.g. `docker run IMAGE bash`) fall through to the
+# default "runner" branch, which forwards the args to `/init` — s6-overlay
+# accepts a user-supplied command and runs it after init, matching upstream
+# behavior. So `docker run --rm -it IMAGE bash` still drops a debug shell.
+#
+# PID 1 after the final exec:
+#   - runner role:     `/init` (s6-overlay)               -> healthcheck detects
+#                                                            Runner.Listener.
+#   - autoscaler role: `/usr/local/bin/gh-runner-autoscale` (bash)
+#                      -> healthcheck detects the autoscaler-mode shortcut
+#                         via /proc/1/cmdline.
+#
+# This wrapper is intentionally tiny: it makes one decision and exec's. No
+# logging, no env normalization, no validation -- the destination script
+# does all of that with the operator-friendly error messages it already has.
+# =============================================================================
+set -u
+
+# Map every known role/synonym onto its canonical name. Print the canonical
+# name when matched; print nothing when not (caller can then fall through).
+_canonical_role() {
+    case "${1:-}" in
+        autoscaler|autoscale|scaler|scale) printf 'autoscaler' ;;
+        runner|gh-runner)                  printf 'runner' ;;
+        *)                                 printf '' ;;
+    esac
+}
+
+# 1) explicit first-arg role (consume it from "$@" only if it matched)
+_role="$(_canonical_role "${1:-}")"
+if [[ -n "${_role}" ]]; then
+    shift
+else
+    # 2) env var
+    _role="$(_canonical_role "${RUNNER_ROLE:-}")"
+fi
+
+# 3) default
+_role="${_role:-runner}"
+
+case "${_role}" in
+    autoscaler)
+        # exec replaces this process; PID 1 becomes gh-runner-autoscale so
+        # the baked-in healthcheck can detect sidecar mode via /proc/1/cmdline.
+        exec /usr/local/bin/gh-runner-autoscale "$@"
+        ;;
+    runner)
+        # Forward to the LSIO baseimage's s6-overlay init. Any extra args
+        # (e.g. `docker run IMAGE bash`) are passed through; s6-overlay runs
+        # the user-supplied command after cont-init completes.
+        exec /init "$@"
+        ;;
+esac

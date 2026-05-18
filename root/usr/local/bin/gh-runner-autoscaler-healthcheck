@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-set -uo pipefail
-
-if pgrep -f 'gh-runner-autoscale' >/dev/null 2>&1; then
-    exit 0
-fi
-
-echo "unhealthy: gh-runner-autoscale process not running"
-exit 1
