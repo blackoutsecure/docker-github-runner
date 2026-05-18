@@ -79,6 +79,13 @@ jobs:
       track_file:       .github/upstream/actions-runner.json
       # Push always rebuilds; schedule only when upstream moves.
       force_run:        ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.force_run) }}
+      # When force_run is a manual dispatch, also bypass downstream caches
+      # so the rebuild ACTUALLY produces a fresh image + balena release.
+      # Without these, docker re-uses GHA layer cache (same digest) and balena
+      # returns the existing release for the same source SHA — the "force"
+      # ends up being a no-op deploy from the device's perspective.
+      docker_force:     ${{ github.event_name == 'workflow_dispatch' && inputs.force_run }}
+      balena_force:     ${{ github.event_name == 'workflow_dispatch' && inputs.force_run }}
 
       image_name:          github-runner
       dockerhub_namespace: ${{ vars.DOCKERHUB_NAMESPACE }}
