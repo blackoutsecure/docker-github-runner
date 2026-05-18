@@ -107,6 +107,26 @@ mkdir -p "${SENTINEL_DIR}"
 # /opt/runner-bin/_diag/Worker_*.log on disk.
 NOISE_RE=' (INFO|VERB|VERBOSE|DEBUG|TRACE) (HostContext|CommandSettings|ConfigurationStore|CredentialManager|RSAFileKeyManager|UnixUtil|CommandLineParser|SystemDControlManager|RunnerService|Terminal|GitHubActionsService|ActionManifestManagerLegacy|ActionManifestManager|ExtensionManager|ActionCommandManager|ExecutionContext|JobServerQueue|Worker|JobRunner|Variables|StepsRunner|ContainerOperationProvider)]| (VERB|VERBOSE|DEBUG|TRACE) ProcessInvokerWrapper]'
 
+# Known-benign WARN messages we deliberately suppress. Unlike NOISE_RE
+# (which blankets entire log classes at INFO/DEBUG/TRACE), this list
+# targets EXACT warning shapes that the runner itself prefixes with
+# "Ignore exception" -- the runner has already swallowed the error and
+# the WARN is purely diagnostic. Each entry is anchored on class +
+# message prefix so any NEW or genuine WARN from the same class still
+# surfaces verbatim.
+#
+# Currently suppressed:
+#   - JobExtension "Ignore exception during read process environment
+#     variables: Access to the path '/proc/<pid>/environ' is denied."
+#     Fires once per job finish in hardened containers (cap_drop=ALL,
+#     no CAP_SYS_PTRACE) when child processes are owned by a different
+#     UID -- typically dockerd / containerd-shim under
+#     DOCKER_IN_DOCKER=true. Granting CAP_SYS_PTRACE just to silence
+#     this would be a security regression; the runner ignores the
+#     failure already. The full payload is still preserved in
+#     /opt/runner-bin/_diag/Worker_*.log on disk.
+BENIGN_WARN_RE=' WARN JobExtension] Ignore exception during read process environment variables:'
+
 # Wait for the diag directory to appear (created on first runner start)
 while [[ ! -d "${DIAG_DIR}" ]]; do
     sleep 1
@@ -380,7 +400,7 @@ while true; do
         # resets the state.
         MIN_SEV=$(_log_severity "${LOG_LEVEL:-info}")
         tail -n 50 -F "$f" 2>/dev/null \
-            | awk -v src="${f##*/}" -v min_sev="${MIN_SEV}" -v noise_re="${NOISE_RE}" '
+            | awk -v src="${f##*/}" -v min_sev="${MIN_SEV}" -v noise_re="${NOISE_RE}" -v benign_warn_re="${BENIGN_WARN_RE}" '
                 BEGIN { suppress = 0 }
                 {
                     # Header line = starts with a runner timestamp + level marker.
@@ -389,8 +409,12 @@ while true; do
 
                     if (is_header) {
                         # New record -- decide whether to suppress this one
-                        # and any continuation lines that follow.
+                        # and any continuation lines that follow. NOISE_RE
+                        # handles INFO/DEBUG class blankets; BENIGN_WARN_RE
+                        # handles tightly-anchored known-benign WARNs that
+                        # the runner itself marks "Ignore exception".
                         if ($0 ~ noise_re) { suppress = 1; next }
+                        if ($0 ~ benign_warn_re) { suppress = 1; next }
                         suppress = 0
                     } else {
                         # Continuation of the previous record. Inherit
