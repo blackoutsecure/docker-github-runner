@@ -221,11 +221,20 @@ probe_runner_online() {
 # ---------------------------------------------------------------------------
 emit_worker_banner() {
     local kind="$1" pid="$2" extra="$3"  # kind: STARTED|FINISHED
-    local now_iso uptime_s parent_pid worker_log cmdline
+    local now_iso uptime_s parent_pid worker_log cmdline=""
     now_iso="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
     parent_pid="$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ' || true)"
-    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | sed 's/  *$//')"
+    # cmdline is only emitted on STARTED; skip the /proc read for FINISHED
+    # (the worker pid is already gone by then, so the shell's `<` open
+    # would print "No such file or directory" to its own stderr — the
+    # `2>/dev/null` below only covers tr's stderr, not the shell-level
+    # open error from the input redirection). Wrap the read in a brace
+    # group with stderr redirected so the rare STARTED-side race (worker
+    # exits between pgrep and this read) is also silenced.
+    if [[ "${kind}" == "STARTED" ]]; then
+        cmdline="$({ tr '\0' ' ' < "/proc/${pid}/cmdline"; } 2>/dev/null | sed 's/  *$//')"
+    fi
     worker_log="$(ls -1t "${DIAG_DIR}"/Worker_*.log 2>/dev/null | head -n1)"
     worker_log="${worker_log##*/}"
     [[ -z "${worker_log}" ]] && worker_log="(pending)"
