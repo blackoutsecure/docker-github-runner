@@ -256,17 +256,20 @@ _apply_scope_filter() {
 }
 
 # Returns the merged + scope-filtered runners[] array on stdout, exit 0 on
-# success. On failure, sets _LAST_FETCH_ERR to a human-readable diagnostic
-# string (HTTP status + curl exit + hint) so callers can surface it. The
-# bare `2>/dev/null` previously here swallowed `curl -S`'s error text, which
-# made every cycle's "Failed to query runner status" warning identical and
-# useless. We now capture the HTTP status via `-w` and the stderr buffer
-# into a variable, then map common cases (401/403/404/5xx, DNS, timeout)
-# to a one-line hint.
-_LAST_FETCH_ERR=''
-
+# success. On failure, logs a human-readable diagnostic (HTTP status +
+# curl exit + hint) directly to stderr and returns 1.
+#
+# Why log from inside the function rather than setting a module-global +
+# logging from the caller: this function is invoked via `$(...)` (command
+# substitution) so its body runs in a SUBSHELL. Any variable mutation
+# (e.g. `_LAST_FETCH_ERR=...`) dies with the subshell and is invisible to
+# the parent. The earlier indirection silently produced `<no diagnostic>`
+# on every failure. Writing to stderr from inside the subshell side-steps
+# this entirely: stderr from the entrypoint process is captured by docker/
+# s6 alongside stdout, so the operator sees the full diagnostic in the
+# usual log stream while the `$()` only captures stdout (the JSON).
 _fetch_runners_json() {
-    local page=1 acc='[]' resp body http curl_exit curl_err page_runners count
+    local page=1 acc='[]' resp body http curl_exit curl_err page_runners count err
     local tmp_err
     tmp_err="$(mktemp 2>/dev/null || echo /tmp/autoscale-curl-err.$$)"
     while [[ "${page}" -le 10 ]]; do
@@ -292,7 +295,8 @@ _fetch_runners_json() {
                 28) hint=' (request timed out — slow or blocked egress)' ;;
                 35|60) hint=' (TLS error — check time sync / CA bundle)' ;;
             esac
-            _LAST_FETCH_ERR="curl exit ${curl_exit}${hint}: ${curl_err:-<no stderr>}"
+            err="curl exit ${curl_exit}${hint}: ${curl_err:-<no stderr>}"
+            log "warn" "GitHub runners API fetch failed: ${err}" >&2
             rm -f "${tmp_err}"
             return 1
         fi
@@ -308,19 +312,20 @@ _fetch_runners_json() {
             esac
             local body_excerpt
             body_excerpt="$(printf '%s' "${body}" | tr -d '\r\n' | head -c 200)"
-            _LAST_FETCH_ERR="HTTP ${http}${hint} body=\"${body_excerpt}\""
+            err="HTTP ${http}${hint} body=\"${body_excerpt}\""
+            log "warn" "GitHub runners API fetch failed: ${err}" >&2
             rm -f "${tmp_err}"
             return 1
         fi
 
         page_runners="$(jq -c '.runners // []' <<< "${body}" 2>/dev/null)" || {
-            _LAST_FETCH_ERR="jq parse error on page ${page} (body not JSON)"
+            log "warn" "GitHub runners API fetch failed: jq parse error on page ${page} (body not JSON)" >&2
             rm -f "${tmp_err}"
             return 1
         }
         count="$(jq 'length' <<< "${page_runners}" 2>/dev/null || echo 0)"
         acc="$(jq -c -s 'add' <<< "${acc}${page_runners}" 2>/dev/null)" || {
-            _LAST_FETCH_ERR="jq merge error on page ${page}"
+            log "warn" "GitHub runners API fetch failed: jq merge error on page ${page}" >&2
             rm -f "${tmp_err}"
             return 1
         }
@@ -328,20 +333,18 @@ _fetch_runners_json() {
         page=$((page + 1))
     done
     rm -f "${tmp_err}"
-    _LAST_FETCH_ERR=''
     printf '%s' "${acc}" | _apply_scope_filter
 }
 
 # Refresh RUNNERS_JSON_CACHE. Returns non-zero on API failure so the caller
 # can skip the cycle cleanly (fixes the pre-existing silent-failure where
 # `read <<< "$(get_runner_counts)"` always succeeded even when the API was
-# unreachable, masking outages as "0 online, 0 busy"). On failure also logs
-# `_LAST_FETCH_ERR` so the operator gets a real diagnostic instead of a
-# generic "Failed to query runner status".
+# unreachable, masking outages as "0 online, 0 busy"). `_fetch_runners_json`
+# has already logged the detailed diagnostic to stderr before returning, so
+# this function stays quiet on the failure path to avoid double-logging.
 refresh_runners_cache() {
     local fresh
     if ! fresh="$(_fetch_runners_json)"; then
-        log "warn" "GitHub runners API fetch failed: ${_LAST_FETCH_ERR:-<no diagnostic>}"
         return 1
     fi
     RUNNERS_JSON_CACHE="${fresh}"

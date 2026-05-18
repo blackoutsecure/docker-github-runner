@@ -274,7 +274,7 @@ emit_health_banner() {
     local kind="$1" status="$2" status_note="$3"
     local uptime_hr="$4" uptime_min="$5" worker_pids="$6"
     local listener_pid load_avg disk_free disk_pct work_dir
-    local worker_count=0 child_total=0
+    local worker_count=0 child_total=0 idle_count=0
 
     listener_pid="$(pgrep -f 'Runner.Listener' 2>/dev/null | head -n1)"
     [[ -z "${listener_pid}" ]] && listener_pid="(none)"
@@ -299,6 +299,18 @@ emit_health_banner() {
         done
     fi
 
+    # Idle Workers: a worker slot is "idle" when the Runner.Listener is alive
+    # and ready to accept a job but is not currently executing one. For the
+    # ephemeral runner model this is 0 or 1 (one container = one slot); if
+    # the runner is later configured to host multiple parallel jobs the
+    # formula generalises. When the listener is dead (listener_pid == "(none)")
+    # no slot can accept work, so idle is reported as 0 -- matching what
+    # GitHub itself would show in the org runners list.
+    if [[ "${listener_pid}" != "(none)" ]]; then
+        idle_count=$(( 1 - worker_count ))
+        (( idle_count < 0 )) && idle_count=0
+    fi
+
     log "info" "======================================================================="
     if [[ "${kind}" == "JOB-HEARTBEAT" ]]; then
         log "info" "  *** JOB HEARTBEAT (${RUNNER_NAME:-$(hostname)}) ***"
@@ -314,6 +326,7 @@ emit_health_banner() {
     log "info" "    Load Avg (1/5/15): ${load_avg}"
     log "info" "    Work Dir         : ${work_dir} (free: ${disk_free}, used: ${disk_pct})"
     log "info" "    Active Workers   : ${worker_count}"
+    log "info" "    Idle Workers     : ${idle_count}"
     if (( worker_count > 0 )); then
         log "info" "    Child Processes  : ${child_total} (across all workers)"
         local now_epoch
