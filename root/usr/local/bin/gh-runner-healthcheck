@@ -21,6 +21,19 @@ set -uo pipefail
 SENTINEL="/run/gh-runner/online"
 STALE_AFTER="${HEALTH_STALE_AFTER:-300}"
 
+# The image is also reused for the autoscaler sidecar via
+# /usr/local/bin/gh-runner-autoscale. That container never launches
+# Runner.Listener, so the runner-specific checks below would keep it
+# permanently unhealthy unless we detect that mode up front.
+pid1_cmdline="$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null || true)"
+if [[ "${pid1_cmdline}" == *gh-runner-autoscale* ]]; then
+    if pgrep -f 'gh-runner-autoscale' >/dev/null 2>&1; then
+        exit 0
+    fi
+    echo "unhealthy: gh-runner-autoscale process not running"
+    exit 1
+fi
+
 # 1. Listener process must be alive
 if ! pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
     echo "unhealthy: Runner.Listener process not running"

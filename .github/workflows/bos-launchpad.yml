@@ -67,7 +67,6 @@ jobs:
   release:
     permissions:
       contents:        write   # monitor tracking-file commit + GitHub Release publish
-      actions:         write   # nested monitor (`gh workflow run`)
       pull-requests:   write   # nested Docker Scout PR annotations
       security-events: write   # nested Docker Scout SARIF upload
     uses: blackoutsecure/bos-automation-hub/.github/workflows/bos-launchpad.yml@main
@@ -93,6 +92,10 @@ jobs:
 
       image_name:          github-runner
       dockerhub_namespace: ${{ vars.DOCKERHUB_NAMESPACE }}
+      companion_docker:    true
+      companion_image_name: github-runner-autoscaler
+      companion_build_target: autoscaler
+      companion_docker_short_description: GitHub Actions runner autoscaler sidecar image
       balena_namespace:    ${{ vars.BALENA_NAMESPACE }}
 
       # Render balena.yml dynamically — no checked-in copy.

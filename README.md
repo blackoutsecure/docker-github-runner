@@ -118,6 +118,23 @@ docker pull blackoutsecure/github-runner:2.333.1       # pinned upstream runner 
 docker pull blackoutsecure/github-runner:sha-<commit>  # pinned source revision
 ```
 
+The Dockerfile now exposes two explicit image targets so the runner and sidecar roles are no longer implicit:
+
+| Target | Purpose | What it includes |
+| --- | --- | --- |
+| `runner` | Full self-hosted runner container | GitHub runner binaries, s6 services, registration hooks, runner health monitoring, optional autoscaler script |
+| `autoscaler` | Dedicated `gh-runner-autoscale` sidecar image | Bash autoscaler, `curl`, `jq`, Docker CLI + Compose plugin, sidecar-specific healthcheck |
+
+```bash
+docker buildx build --target runner -t blackoutsecure/github-runner:local .
+docker buildx build --target autoscaler -t blackoutsecure/github-runner-autoscaler:local .
+```
+
+Published Docker Hub images now cover both roles:
+
+- `blackoutsecure/github-runner` for the full runner container
+- `blackoutsecure/github-runner-autoscaler` for the dedicated sidecar image
+
 | Tag | Meaning |
 | --- | --- |
 | `latest` | Latest release on top of Ubuntu 24.04 Noble; multi-arch |
@@ -267,7 +284,18 @@ docker compose up -d --scale gh-runner=3
 
 Dynamic scaling here means **varying the count of ephemeral replicas** based on observed busy-ratio. Concurrency comes from the number of replicas, never from anything inside a single container — see [Ephemeral mode and the concurrency model](#ephemeral-mode-and-the-concurrency-model).
 
-The repository ships [`scripts/autoscale.sh`](scripts/autoscale.sh) — a small Bash autoscaler that polls the GitHub API for the busy/online ratio and asks a configurable **backend** to adjust the pool size. The script is baked into the image at `/usr/local/bin/gh-runner-autoscale`, so the sidecar can reuse the same image with no host bind mount of the script.
+The repository ships [`scripts/autoscale.sh`](scripts/autoscale.sh) — a small Bash autoscaler that polls the GitHub API for the busy/online ratio and asks a configurable **backend** to adjust the pool size. You can run it either from the full `runner` image (via `entrypoint: ["/usr/local/bin/gh-runner-autoscale"]`) or from the dedicated `autoscaler` Dockerfile target, which trims away runner-only binaries and uses a sidecar-specific healthcheck.
+
+What the sidecar actually needs:
+
+| Capability | Needed by sidecar | Why |
+| --- | --- | --- |
+| `curl` + CA roots | yes | Poll the GitHub REST API |
+| `jq` | yes | Merge pages, filter labels/names, and compute counts |
+| Docker CLI + Compose plugin | only for `SCALE_BACKEND=compose` | Needed for `docker compose up --scale`, `ps`, and `rm` |
+| Runner.Listener binaries | no | The sidecar never registers or executes jobs |
+| s6 runner services | no | The sidecar is a single-process container |
+| `/config` runner state volume | no | Sidecar decisions come from GitHub API state, not local runner state |
 
 | `SCALE_BACKEND` | Use it for | What it does |
 | --- | --- | --- |
@@ -290,8 +318,7 @@ Example — two sidecars, one per fleet:
 
 ```yaml
   gh-runner-scaler-arm64:
-    image: blackoutsecure/github-runner:latest
-    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    image: blackoutsecure/github-runner-autoscaler:latest
     environment:
       - RUNNER_URL=https://github.com/MY-ORG
       - GITHUB_PAT=ghp_xxx
@@ -304,8 +331,7 @@ Example — two sidecars, one per fleet:
     restart: always
 
   gh-runner-scaler-x64:
-    image: blackoutsecure/github-runner:latest
-    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    image: blackoutsecure/github-runner-autoscaler:latest
     environment:
       - RUNNER_URL=https://github.com/MY-ORG
       - GITHUB_PAT=ghp_xxx
@@ -316,6 +342,8 @@ Example — two sidecars, one per fleet:
       - RUNNER_SCOPE_LABELS=self-hosted,x64
     restart: always
 ```
+
+If you intentionally run the sidecar from the full `runner` image instead of `blackoutsecure/github-runner-autoscaler`, keep `entrypoint: ["/usr/local/bin/gh-runner-autoscale"]` and disable the inherited runner healthcheck. The dedicated autoscaler image does not need either workaround.
 
 When no scope filter is set the sidecar logs `Scope filter : <none> -- counting ALL runners in <RUNNER_URL>` at startup so it's obvious when this is unintentional.
 
@@ -342,8 +370,7 @@ services:
     restart: always
 
   gh-runner-scaler:
-    image: blackoutsecure/github-runner:latest
-    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    image: blackoutsecure/github-runner-autoscaler:latest
     environment:
       - RUNNER_URL=https://github.com/OWNER/REPO
       - GITHUB_PAT=ghp_xxx
@@ -409,8 +436,7 @@ esac
 
 ```yaml
   gh-runner-scaler:
-    image: blackoutsecure/github-runner:latest
-    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    image: blackoutsecure/github-runner-autoscaler:latest
     environment:
       - RUNNER_URL=https://github.com/MY-ORG
       - GITHUB_PAT=ghp_xxx
@@ -444,8 +470,7 @@ When you want the autoscaler to *recommend* a target replica count but not act o
 
 ```yaml
   gh-runner-scaler:
-    image: blackoutsecure/github-runner:latest
-    entrypoint: ["/usr/local/bin/gh-runner-autoscale"]
+    image: blackoutsecure/github-runner-autoscaler:latest
     environment:
       - RUNNER_URL=https://github.com/MY-ORG
       - GITHUB_PAT=ghp_xxx
@@ -1061,6 +1086,8 @@ The sentinel is refreshed by the heartbeat loop in `svc-gh-runner-logs`. When a 
 | Timeout | `10s` |
 | Start period | `300s` (covers slow first-time runner extraction / register) |
 | Retries | `5` |
+
+The dedicated `autoscaler` Dockerfile target uses `/usr/local/bin/gh-runner-autoscaler-healthcheck` instead, which only checks that the autoscaler process is alive.
 
 ```bash
 docker inspect --format='{{.State.Health.Status}}' gh-runner
