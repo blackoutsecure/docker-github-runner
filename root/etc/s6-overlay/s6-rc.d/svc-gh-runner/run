@@ -4,13 +4,23 @@ set -uo pipefail
 
 cd /opt/runner-bin
 
+# Use the shared logger for the 3 startup lines we emit BEFORE the
+# `exec > >(awk ...)` pipeline takes over stdout. After the exec we
+# CANNOT call log() because the awk filter would double-prefix every
+# line with its own `<ts> svc-gh-runner[runner]:` header. That's why
+# Runner.Listener output gets prefixed by awk (it's unstructured), but
+# our own startup messages use log() for the canonical format.
+# shellcheck disable=SC1091
+. /usr/local/bin/log-functions.sh
+LOG_TAG="svc-gh-runner"
+
 # Emit and flush before any pipeline setup so the operator can see the
 # longrun has actually been started by s6 (otherwise a kill in the next
 # few ms would leave init looking like the last thing that ran).
-echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-gh-runner[info]: longrun entered -- preparing Runner.Listener"
+log "info" "longrun entered -- preparing Runner.Listener"
 sync 2>/dev/null || true
-echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-gh-runner[info]: Starting runner (${RUNNER_NAME:-$(hostname)}, ephemeral=${RUNNER_EPHEMERAL:-false})"
-echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-gh-runner[info]: Handing off to Runner.Listener -- connecting to GitHub Actions and waiting for jobs..."
+log "info" "Starting runner (${RUNNER_NAME:-$(hostname)}, ephemeral=${RUNNER_EPHEMERAL:-false})"
+log "info" "Handing off to Runner.Listener -- connecting to GitHub Actions and waiting for jobs..."
 
 # We pipe Runner.Listener output through awk so every line on the console
 # is prefixed with `<ts> svc-gh-runner[runner]:`. CRITICAL: we must use

@@ -29,7 +29,6 @@ RUN apt-get update && \
         libssl3t64 \
         lsb-release \
         python3 \
-        sudo \
         unzip \
         zip && \
     install -m 0755 -d /etc/apt/keyrings && \
@@ -47,8 +46,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 COPY --link build/ /tmp/build/
-RUN chmod +x /tmp/build/*.sh && \
-    /tmp/build/install-runner.sh && \
+RUN /tmp/build/install-runner.sh && \
     rm -rf /tmp/build && \
     mkdir -p /tmp /scaler && \
     chmod 1777 /tmp && \
@@ -64,7 +62,6 @@ COPY --link root/ /
 # can use the sidecar pattern. Inert unless invoked via an explicit entrypoint
 # override on a sidecar service; the normal s6 boot path never touches it.
 COPY --link scripts/autoscale.sh /usr/local/bin/gh-runner-autoscale
-RUN chmod 0755 /usr/local/bin/gh-runner-autoscale
 
 ENV HOME="/config" \
     RUNNER_WORKDIR="/config/work" \
@@ -102,7 +99,7 @@ ENV HOME="/config" \
     S6_KILL_GRACETIME="30000"
 
 COPY --link build/finalize.sh /tmp/finalize.sh
-RUN chmod +x /tmp/finalize.sh && /tmp/finalize.sh && rm -f /tmp/finalize.sh
+RUN /tmp/finalize.sh && rm -f /tmp/finalize.sh
 
 VOLUME ["/config"]
 

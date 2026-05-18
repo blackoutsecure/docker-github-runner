@@ -140,7 +140,7 @@ as_runner_user() {
 case "${LOG_LEVEL:-info}" in
     debug|info|warn|error|fatal|DEBUG|INFO|WARN|ERROR|FATAL) : ;;
     *)
-        echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') ${LOG_TAG}[warn]: Unknown LOG_LEVEL='${LOG_LEVEL}', falling back to 'info' (valid: debug|info|warn|error|fatal)"
+        log "warn" "Unknown LOG_LEVEL='${LOG_LEVEL}', falling back to 'info' (valid: debug|info|warn|error|fatal)"
         export LOG_LEVEL="info"
         ;;
 esac

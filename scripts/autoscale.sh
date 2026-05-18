@@ -105,9 +105,37 @@ SCALE_EMIT_FILE="${SCALE_EMIT_FILE:-}"
 RUNNER_SCOPE_LABELS="${RUNNER_SCOPE_LABELS:-}"
 RUNNER_SCOPE_NAME_REGEX="${RUNNER_SCOPE_NAME_REGEX:-}"
 
-log() {
-    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') autoscaler[$1]: $2"
-}
+# ---------------------------------------------------------------------------
+# Logging
+#
+# Prefer the shared /usr/local/bin/log-functions.sh that the rest of the
+# runner image uses, so the scaler sidecar logs in the same format and
+# respects the same LOG_LEVEL knob as the s6 init/svc scripts. Falls back
+# to an inline minimal `log()` if the shared helper is missing (e.g. when
+# running this script standalone on a developer workstation for testing).
+#
+# Format (both implementations):
+#     <RFC3339 UTC timestamp> autoscaler[<level>]: <message>
+#
+# All scaler output goes to stdout (the entrypoint's stdout is what
+# `docker logs` / balenaCloud captures); diagnostic failure paths inside
+# `_fetch_runners_json` deliberately redirect to stderr so they bypass the
+# `$()` JSON capture in `refresh_runners_cache` while still landing in the
+# same combined log stream the operator sees.
+# ---------------------------------------------------------------------------
+LOG_TAG="autoscaler"
+if [[ -r /usr/local/bin/log-functions.sh ]]; then
+    # shellcheck disable=SC1091
+    . /usr/local/bin/log-functions.sh
+else
+    log() {
+        printf '%s %s[%s]: %s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            "${LOG_TAG:-autoscaler}" \
+            "$1" \
+            "$2"
+    }
+fi
 
 # Clamp $1 into the inclusive range [$2, $3].
 clamp() {
@@ -170,11 +198,11 @@ case "${SCALE_BACKEND}" in
         # logging mv errors every cycle.
         _emit_dir="$(dirname "${SCALE_EMIT_FILE}")"
         if ! mkdir -p "${_emit_dir}" 2>/dev/null; then
-            log "fatal" "Cannot create SCALE_EMIT_FILE parent dir '${_emit_dir}' — check container filesystem mounts"
+            log "fatal" "Cannot create SCALE_EMIT_FILE parent dir '${_emit_dir}' -- check container filesystem mounts"
             exit 1
         fi
         if ! ( : > "${SCALE_EMIT_FILE}.writetest.$$" ) 2>/dev/null; then
-            log "fatal" "SCALE_EMIT_FILE parent dir '${_emit_dir}' is not writable — check tmpfs mount mode (need owner-writable for container UID $(id -u))"
+            log "fatal" "SCALE_EMIT_FILE parent dir '${_emit_dir}' is not writable -- check tmpfs mount mode (need owner-writable for container UID $(id -u))"
             exit 1
         fi
         rm -f "${SCALE_EMIT_FILE}.writetest.$$"
@@ -585,10 +613,12 @@ graceful_scale_down() {
     backend_scale_to "${target}"
 }
 
-# ── Banner ────────────────────────────────────────────────────────────────────
-log "info" "═══════════════════════════════════════════════════════"
+# Banner. ASCII '=' only -- balenaCloud's dashboard log viewer mangles
+# Unicode box-drawing characters (U+2550 etc.) into 'a-circumflex' single-
+# byte rendering. Matches the runner heartbeat banner style.
+log "info" "======================================================="
 log "info" "  GitHub Actions Runner Autoscaler"
-log "info" "═══════════════════════════════════════════════════════"
+log "info" "======================================================="
 log "info" "  Backend      : ${SCALE_BACKEND}"
 log "info" "  Mode         : ${SCALE_MODE}"
 log "info" "  Min replicas : ${SCALE_MIN}"
@@ -611,7 +641,7 @@ case "${SCALE_BACKEND}" in
     exec)    log "info" "  Exec cmd     : ${SCALE_EXEC} (supports_remove=${SCALE_EXEC_SUPPORTS_REMOVE})" ;;
     emit)    log "info" "  Emit file    : ${SCALE_EMIT_FILE}" ;;
 esac
-log "info" "═══════════════════════════════════════════════════════"
+log "info" "======================================================="
 
 # ── Fixed mode: set to MAX and hold ──────────────────────────────────────────
 if [[ "${SCALE_MODE}" == "fixed" ]]; then
@@ -697,7 +727,7 @@ while true; do
     # Scale-up: if busy ratio exceeds threshold and we're below MAX
     if [[ "${BUSY_PCT}" -ge "${SCALE_UP_THRESHOLD}" && "${CURRENT}" -lt "${SCALE_MAX}" ]]; then
         NEW_COUNT="$(clamp $((CURRENT + 1)) "${SCALE_MIN}" "${SCALE_MAX}")"
-        log "info" "Busy ratio ${BUSY_PCT}% >= ${SCALE_UP_THRESHOLD}% → scaling up to ${NEW_COUNT}"
+        log "info" "Busy ratio ${BUSY_PCT}% >= ${SCALE_UP_THRESHOLD}% -> scaling up to ${NEW_COUNT}"
         if backend_scale_to "${NEW_COUNT}"; then
             LAST_SCALE_TIME="${NOW}"
         fi
@@ -707,7 +737,7 @@ while true; do
     # Scale-down: if busy ratio is below threshold and we're above MIN
     if [[ "${BUSY_PCT}" -le "${SCALE_DOWN_THRESHOLD}" && "${CURRENT}" -gt "${SCALE_MIN}" ]]; then
         NEW_COUNT="$(clamp $((CURRENT - 1)) "${SCALE_MIN}" "${SCALE_MAX}")"
-        log "info" "Busy ratio ${BUSY_PCT}% <= ${SCALE_DOWN_THRESHOLD}% → graceful scale-down to ${NEW_COUNT}"
+        log "info" "Busy ratio ${BUSY_PCT}% <= ${SCALE_DOWN_THRESHOLD}% -> graceful scale-down to ${NEW_COUNT}"
         if graceful_scale_down "${NEW_COUNT}" "${CURRENT}"; then
             LAST_SCALE_TIME="${NOW}"
         fi
