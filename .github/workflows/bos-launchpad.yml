@@ -20,6 +20,10 @@ on:
       - '.dockerignore'
       - 'build/**'
       - 'root/**'
+      # scripts/autoscale.sh is COPYed into the image at
+      # /usr/local/bin/gh-runner-autoscale (Dockerfile line ~66), so
+      # changes here must rebuild even when nothing under root/** moved.
+      - 'scripts/**'
       - 'docker-compose.yml'
       - 'README.md'
       - '.github/upstream/**'
