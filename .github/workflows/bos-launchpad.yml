@@ -49,14 +49,6 @@ on:
         description: 'Force: run pipeline even if upstream unchanged'
         type: boolean
         default: false
-      # `auto` lets the hub decide prerelease from the SemVer suffix.
-      # `'true'`/`'false'` force the flag. Ignored unless
-      # `stage_github_release` is on.
-      release_prerelease:
-        description: 'Release: prerelease flag (only for stage_github_release)'
-        type: choice
-        options: [auto, 'true', 'false']
-        default: auto
 
 # No top-level `concurrency:` — the hub workflow owns serialization.
 # Declaring it on both sides triggers a GHA self-deadlock.
@@ -142,11 +134,6 @@ jobs:
 
         Repository: https://github.com/${{ github.repository }}
         Upstream application: https://github.com/actions/runner
-
-      # `release_prerelease`: `auto` collapses to empty (hub decides from
-      # the SemVer suffix); `'true'`/`'false'` force the flag. Collapses
-      # to `''` outside `workflow_dispatch`.
-      release_prerelease: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_prerelease != 'auto') && inputs.release_prerelease || '' }}
     secrets:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
