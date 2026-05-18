@@ -84,9 +84,13 @@ jobs:
 
       image_name:          github-runner
       dockerhub_namespace: ${{ vars.DOCKERHUB_NAMESPACE }}
-      companion_docker:    true
-      companion_image_name: github-runner-autoscaler
-      companion_build_target: autoscaler
+      # Sidecar autoscaler image built from the `autoscaler` Dockerfile stage
+      # and published to Docker Hub alongside the main runner image. Requires
+      # bos-automation-hub support for companion_* inputs (added in the hub's
+      # bos-launchpad/release reusable workflows).
+      companion_docker:                   true
+      companion_image_name:               github-runner-autoscaler
+      companion_build_target:             autoscaler
       companion_docker_short_description: GitHub Actions runner autoscaler sidecar image
       balena_namespace:    ${{ vars.BALENA_NAMESPACE }}
 
