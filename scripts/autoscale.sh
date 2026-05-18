@@ -256,30 +256,92 @@ _apply_scope_filter() {
 }
 
 # Returns the merged + scope-filtered runners[] array on stdout, exit 0 on
-# success.
+# success. On failure, sets _LAST_FETCH_ERR to a human-readable diagnostic
+# string (HTTP status + curl exit + hint) so callers can surface it. The
+# bare `2>/dev/null` previously here swallowed `curl -S`'s error text, which
+# made every cycle's "Failed to query runner status" warning identical and
+# useless. We now capture the HTTP status via `-w` and the stderr buffer
+# into a variable, then map common cases (401/403/404/5xx, DNS, timeout)
+# to a one-line hint.
+_LAST_FETCH_ERR=''
+
 _fetch_runners_json() {
-    local page=1 acc='[]' resp page_runners count
+    local page=1 acc='[]' resp body http curl_exit curl_err page_runners count
+    local tmp_err
+    tmp_err="$(mktemp 2>/dev/null || echo /tmp/autoscale-curl-err.$$)"
     while [[ "${page}" -le 10 ]]; do
-        resp="$(curl -fsSL \
+        # `-w '\nHTTPSTATUS:%{http_code}'` appends the final HTTP status on
+        # its own line so we can tease it apart even when curl exits 0.
+        # Drop `-f` so curl returns 4xx/5xx bodies (useful for error text)
+        # but still exits non-zero — handled below.
+        resp="$(curl -sSL \
+            -w '\nHTTPSTATUS:%{http_code}' \
             -H "Authorization: token ${GITHUB_PAT}" \
             -H "Accept: application/vnd.github+json" \
-            "${RUNNERS_API_URL}?per_page=100&page=${page}" 2>/dev/null)" || return 1
-        page_runners="$(jq -c '.runners // []' <<< "${resp}" 2>/dev/null)" || return 1
+            "${RUNNERS_API_URL}?per_page=100&page=${page}" 2>"${tmp_err}")"
+        curl_exit=$?
+        http="${resp##*HTTPSTATUS:}"
+        body="${resp%$'\n'HTTPSTATUS:*}"
+        curl_err="$(tr -d '\r' < "${tmp_err}" | head -c 200)"
+
+        if [[ "${curl_exit}" -ne 0 ]]; then
+            local hint=''
+            case "${curl_exit}" in
+                6)  hint=' (DNS resolution failed — check container egress / DNS)' ;;
+                7)  hint=' (connection refused — check egress firewall to api.github.com:443)' ;;
+                28) hint=' (request timed out — slow or blocked egress)' ;;
+                35|60) hint=' (TLS error — check time sync / CA bundle)' ;;
+            esac
+            _LAST_FETCH_ERR="curl exit ${curl_exit}${hint}: ${curl_err:-<no stderr>}"
+            rm -f "${tmp_err}"
+            return 1
+        fi
+
+        if [[ "${http}" != 2* ]]; then
+            local hint=''
+            # shellcheck disable=SC2016  # backticks in hints are markdown-style docs, not command subs
+            case "${http}" in
+                401) hint=' — token is invalid, expired, or revoked. Rotate GITHUB_PAT (`balena env set GITHUB_PAT ...`).' ;;
+                403) hint=' — likely SAML enforcement on a classic PAT (open https://github.com/settings/tokens, edit PAT, Configure SSO → Authorize for the org) OR primary rate limit. Check `X-RateLimit-Remaining` from `curl -I` if SSO is already authorized.' ;;
+                404) hint=' — RUNNERS_API_URL not found. Verify RUNNER_URL points at a real org/repo/enterprise that the token can see.' ;;
+                5*) hint=' — GitHub API server error. Usually transient; check https://www.githubstatus.com.' ;;
+            esac
+            local body_excerpt
+            body_excerpt="$(printf '%s' "${body}" | tr -d '\r\n' | head -c 200)"
+            _LAST_FETCH_ERR="HTTP ${http}${hint} body=\"${body_excerpt}\""
+            rm -f "${tmp_err}"
+            return 1
+        fi
+
+        page_runners="$(jq -c '.runners // []' <<< "${body}" 2>/dev/null)" || {
+            _LAST_FETCH_ERR="jq parse error on page ${page} (body not JSON)"
+            rm -f "${tmp_err}"
+            return 1
+        }
         count="$(jq 'length' <<< "${page_runners}" 2>/dev/null || echo 0)"
-        acc="$(jq -c -s 'add' <<< "${acc}${page_runners}" 2>/dev/null)" || return 1
+        acc="$(jq -c -s 'add' <<< "${acc}${page_runners}" 2>/dev/null)" || {
+            _LAST_FETCH_ERR="jq merge error on page ${page}"
+            rm -f "${tmp_err}"
+            return 1
+        }
         [[ "${count}" -lt 100 ]] && break
         page=$((page + 1))
     done
+    rm -f "${tmp_err}"
+    _LAST_FETCH_ERR=''
     printf '%s' "${acc}" | _apply_scope_filter
 }
 
 # Refresh RUNNERS_JSON_CACHE. Returns non-zero on API failure so the caller
 # can skip the cycle cleanly (fixes the pre-existing silent-failure where
 # `read <<< "$(get_runner_counts)"` always succeeded even when the API was
-# unreachable, masking outages as "0 online, 0 busy").
+# unreachable, masking outages as "0 online, 0 busy"). On failure also logs
+# `_LAST_FETCH_ERR` so the operator gets a real diagnostic instead of a
+# generic "Failed to query runner status".
 refresh_runners_cache() {
     local fresh
     if ! fresh="$(_fetch_runners_json)"; then
+        log "warn" "GitHub runners API fetch failed: ${_LAST_FETCH_ERR:-<no diagnostic>}"
         return 1
     fi
     RUNNERS_JSON_CACHE="${fresh}"
@@ -561,9 +623,9 @@ if [[ "${SCALE_MODE}" == "fixed" ]]; then
             if refresh_runners_cache; then
                 read -r ONLINE BUSY <<< "$(cached_runner_counts)"
                 _emit_state "${SCALE_MAX}" 0 "${ONLINE}" "${BUSY}" "$(cached_idle_runner_names)"
-            else
-                log "warn" "Failed to query runner status, skipping emit cycle"
             fi
+            # refresh_runners_cache logs its own detailed diagnostic on
+            # failure; no generic skip-cycle warning needed here.
             continue
         fi
 
@@ -587,7 +649,7 @@ while true; do
     NOW="$(date +%s)"
 
     if ! refresh_runners_cache; then
-        log "warn" "Failed to query runner status, skipping cycle"
+        # refresh_runners_cache logged the detailed reason already.
         continue
     fi
 
