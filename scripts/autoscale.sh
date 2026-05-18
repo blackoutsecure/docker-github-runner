@@ -298,6 +298,7 @@ _apply_scope_filter() {
 # usual log stream while the `$()` only captures stdout (the JSON).
 _fetch_runners_json() {
     local page=1 acc='[]' resp body http curl_exit curl_err page_runners count err
+    local attempt curl_exit_first
     local tmp_err
     tmp_err="$(mktemp 2>/dev/null || echo /tmp/autoscale-curl-err.$$)"
     while [[ "${page}" -le 10 ]]; do
@@ -305,25 +306,51 @@ _fetch_runners_json() {
         # its own line so we can tease it apart even when curl exits 0.
         # Drop `-f` so curl returns 4xx/5xx bodies (useful for error text)
         # but still exits non-zero — handled below.
-        resp="$(curl -sSL \
-            -w '\nHTTPSTATUS:%{http_code}' \
-            -H "Authorization: token ${GITHUB_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            "${RUNNERS_API_URL}?per_page=100&page=${page}" 2>"${tmp_err}")"
-        curl_exit=$?
+        #
+        # Single in-cycle retry on transient connection-reset curl codes
+        # (18 partial file, 52 empty reply, 55 send error, 56 recv error).
+        # These are typically intermediate NAT keepalive timeouts or
+        # GitHub edge sockets recycling mid-request and self-heal on the
+        # next attempt. Other curl error classes (DNS/connect/TLS/timeout)
+        # are NOT retried so genuine misconfiguration surfaces promptly.
+        curl_exit_first=0
+        for attempt in 1 2; do
+            resp="$(curl -sSL \
+                -w '\nHTTPSTATUS:%{http_code}' \
+                -H "Authorization: token ${GITHUB_PAT}" \
+                -H "Accept: application/vnd.github+json" \
+                "${RUNNERS_API_URL}?per_page=100&page=${page}" 2>"${tmp_err}")"
+            curl_exit=$?
+            if [[ "${attempt}" -eq 1 ]]; then
+                case "${curl_exit}" in
+                    18|52|55|56)
+                        curl_exit_first="${curl_exit}"
+                        sleep 1
+                        continue
+                        ;;
+                esac
+            fi
+            break
+        done
+        if [[ "${curl_exit_first}" -ne 0 && "${curl_exit}" -eq 0 ]]; then
+            log "info" "GitHub runners API recovered after transient curl exit ${curl_exit_first} (one retry succeeded)" >&2
+        fi
         http="${resp##*HTTPSTATUS:}"
         body="${resp%$'\n'HTTPSTATUS:*}"
         curl_err="$(tr -d '\r' < "${tmp_err}" | head -c 200)"
 
         if [[ "${curl_exit}" -ne 0 ]]; then
             local hint=''
+            local retry_note=''
+            [[ "${curl_exit_first}" -ne 0 ]] && retry_note=' (retried once after initial transient failure)'
             case "${curl_exit}" in
                 6)  hint=' (DNS resolution failed — check container egress / DNS)' ;;
                 7)  hint=' (connection refused — check egress firewall to api.github.com:443)' ;;
+                18|52|55|56) hint=' (transient connection reset by GitHub edge or intermediate NAT — usually self-heals; investigate egress if persistent across multiple cycles)' ;;
                 28) hint=' (request timed out — slow or blocked egress)' ;;
                 35|60) hint=' (TLS error — check time sync / CA bundle)' ;;
             esac
-            err="curl exit ${curl_exit}${hint}: ${curl_err:-<no stderr>}"
+            err="curl exit ${curl_exit}${hint}${retry_note}: ${curl_err:-<no stderr>}"
             log "warn" "GitHub runners API fetch failed: ${err}" >&2
             rm -f "${tmp_err}"
             return 1
