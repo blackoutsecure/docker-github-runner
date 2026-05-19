@@ -571,7 +571,7 @@ docker run -d \
 | `RUNNER_NAME` | container hostname | Display name; auto-deduplicated (`-1`, `-2`, …) when an online runner with the same name already exists |
 | `RUNNER_LABELS` | `self-hosted` | Comma-separated custom labels (e.g. `self-hosted,linux,arm64,gpu`) |
 | `RUNNER_GROUP` | `Default` | Runner group (org / enterprise only); created via API if missing |
-| `RUNNER_WORKDIR` | `/config/work` | Job working directory |
+| `RUNNER_WORKDIR` | `/config/work/<runner-name>` | Job working directory. If unset, defaults to a per-runner isolated path derived from `RUNNER_NAME` |
 | `RUNNER_EPHEMERAL` | `false` | When `true`, runner accepts one job, runs it, and exits |
 | `RUNNER_REPLACE_EXISTING` | `true` | Replace an existing runner with the same name |
 | `DISABLE_RUNNER_UPDATE` | `false` | Disable in-process upstream runner auto-updates |
@@ -619,6 +619,8 @@ The `_FILE` variant takes precedence over the plain variant when both are set.
 | `ONLINE_PROBE_EVERY` | `1` (persistent) / `0` (ephemeral) | Probe the GitHub API for runner status every N heartbeat ticks; `0` disables (requires `GITHUB_PAT` / `GITHUB_TOKEN`) |
 | `ONLINE_FAIL_THRESHOLD` | `3` | Consecutive offline detections before triggering `ON_OFFLINE_ACTION` |
 | `ON_OFFLINE_ACTION` | `restart` | `none` (log only) \| `restart` (graceful s6 restart) \| `shutdown` (container exits, orchestrator restarts it) |
+| `IDLE_RECYCLE_AFTER` | _ephemeral-aware_: `21600` (6 h) when `RUNNER_EPHEMERAL=true`, `172800` (2 d) otherwise | Recycle the runner after N seconds continuously idle. `0` disables. Minimum when enabled: `300`. The timer **resets when a worker starts** so it never interrupts a running job. See [Idle recycle policy](#idle-recycle-policy) |
+| `IDLE_RECYCLE_ACTION` | `shutdown` | Action when idle threshold is reached: `restart` (runner service only) \| `shutdown` (full container recycle) \| `none` (log only) |
 | `HEALTH_STALE_AFTER` | `300` | Seconds before the Docker `HEALTHCHECK` reports unhealthy if the online sentinel goes stale |
 
 #### Stale offline runner cleanup
@@ -1136,6 +1138,37 @@ If the runner is reported `offline` by GitHub for `ONLINE_FAIL_THRESHOLD` consec
 | `none` | Log only — let the Docker `HEALTHCHECK` and your orchestrator decide |
 | `restart` *(default)* | Graceful restart of `svc-gh-runner` via `s6-svc -r` (keeps the container, re-registers the listener) |
 | `shutdown` | Tear the container down so `restart: always` brings it back fresh |
+
+### Idle recycle policy
+
+Long-running runner processes accumulate state — listener memory, fd churn, temp
+files in `/tmp`, stale credentials caches. The heartbeat tracks how long the
+runner has been continuously **idle** (no `Runner.Worker` child) and, when the
+threshold is hit, takes `IDLE_RECYCLE_ACTION`. The timer **resets the instant a
+worker starts**, so an idle recycle never interrupts a running job.
+
+`IDLE_RECYCLE_AFTER` defaults are ephemeral-aware:
+
+| `RUNNER_EPHEMERAL` | Default `IDLE_RECYCLE_AFTER` | Rationale |
+| --- | --- | --- |
+| `true`  *(single-job)* | `21600` (6 h)  | Ephemeral users opt into "fresh state per job". A 6-hour ceiling caps state accumulation when no jobs arrive and matches that intent. After recycle, `restart: always` brings the container back fresh and re-registers a brand-new runner. |
+| `false` *(persistent, default)* | `172800` (2 d) | Long-lived listener hygiene without churning processes operators might be actively using. Long enough to span a quiet weekend without recycling mid-task, short enough to bound memory / fd / temp-file growth. |
+
+Override either default by setting `IDLE_RECYCLE_AFTER` explicitly:
+
+```yaml
+environment:
+  RUNNER_EPHEMERAL: "true"
+  IDLE_RECYCLE_AFTER: "14400"   # ephemeral fleet, recycle after 4 h idle
+  # IDLE_RECYCLE_AFTER: "0"     # disable recycle entirely
+  IDLE_RECYCLE_ACTION: "shutdown"
+```
+
+Values `1..299` are clamped to `300` as a safety floor against accidental
+tight recycle loops. The startup banner and the `HEALTH HEARTBEAT` block both
+print the **effective** value plus its provenance, e.g.
+`21600s [default (ephemeral mode)]` or `14400s [user override]`, so it is easy
+to spot when a fleet inherited a default it didn't intend.
 
 ### s6 service supervision
 

@@ -80,6 +80,18 @@
 # Usage:
 #   Typically run as a compose service — see the Autoscaling section in README.md.
 #   Can also be run standalone:  RUNNER_URL=... GITHUB_PAT=... ./scripts/autoscale.sh
+#
+# Source layout vs runtime layout:
+#   This file lives at `scripts/autoscale.sh` in the repo (single source of
+#   truth, easy to clone-and-run on a developer workstation without building
+#   the image first). The Dockerfile COPYs it to
+#   `/usr/local/bin/gh-runner-autoscale` at image build time so it sits next
+#   to the rest of the image's tooling (entrypoint, healthcheck, log /
+#   banner / gh-api shared helpers). It is intentionally NOT an s6
+#   service inside the runner container: it runs as a SEPARATE SIDECAR
+#   container (RUNNER_ROLE=autoscaler) supervised by Docker / balena-engine
+#   / k8s itself, so it can scale the runner pool from outside without
+#   competing with the runner's own s6 supervision tree.
 # =============================================================================
 set -uo pipefail
 
@@ -134,6 +146,55 @@ else
             "${LOG_TAG:-autoscaler}" \
             "$1" \
             "$2"
+    }
+fi
+
+# Banner primitives -- shared with the runner heartbeat so AUTOSCALER STATUS
+# blocks have the same shape as HEALTH HEARTBEAT blocks in the same log
+# stream. Standalone (dev workstation) execution falls back to inline
+# definitions so the script stays self-contained.
+if [[ -r /usr/local/bin/banner-functions.sh ]]; then
+    # shellcheck disable=SC1091
+    . /usr/local/bin/banner-functions.sh
+else
+    : "${BANNER_LINE:======================================================================}"
+    : "${BANNER_THIN:=----------------------------------------------------------------------}"
+    : "${BANNER_KEY_WIDTH:=17}"
+    banner_top()    { log "${1:-info}" "${BANNER_LINE}"; }
+    banner_bottom() { log "${1:-info}" "${BANNER_LINE}"; }
+    banner_thin()   { log "${1:-info}" "${BANNER_THIN}"; }
+    banner_title()  { local _l="$1"; shift; log "${_l}" "  *** $* ***"; }
+    banner_kv() {
+        local _l="$1" _k="$2" _v="$3" _p
+        printf -v _p '%-*s' "${BANNER_KEY_WIDTH}" "${_k}"
+        log "${_l}" "    ${_p}: ${_v}"
+    }
+    banner_section() {
+        local _l="$1" _h="$2"
+        log "${_l}" "  [${_h}]"
+        log "${_l}" "  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+    }
+fi
+
+# Runners-URL resolver -- shared with the runner heartbeat probe and the
+# init-time registration helpers. Standalone fallback for dev workstations
+# that run autoscale.sh outside the container image.
+if [[ -r /usr/local/bin/gh-api.sh ]]; then
+    # shellcheck disable=SC1091
+    . /usr/local/bin/gh-api.sh
+else
+    gh_api_runners_url() {
+        local raw="${1:-}" url_path
+        url_path="${raw#https://github.com/}"
+        url_path="${url_path%/}"
+        local api_base="https://api.github.com"
+        if [[ "${url_path}" == enterprises/* ]]; then
+            echo "${api_base}/enterprises/${url_path#enterprises/}/actions/runners"
+        elif [[ "${url_path}" == */* ]]; then
+            echo "${api_base}/repos/${url_path}/actions/runners"
+        else
+            echo "${api_base}/orgs/${url_path}/actions/runners"
+        fi
     }
 fi
 
@@ -239,21 +300,10 @@ COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
 [[ -n "${COMPOSE_PROJECT}" ]] && COMPOSE_ARGS+=(-p "${COMPOSE_PROJECT}")
 
 # ── Resolve API URL ──────────────────────────────────────────────────────────
-resolve_runners_api_url() {
-    local url_path="${RUNNER_URL#https://github.com/}"
-    url_path="${url_path%/}"
-    local api_base="https://api.github.com"
-
-    if [[ "${url_path}" == enterprises/* ]]; then
-        echo "${api_base}/enterprises/${url_path#enterprises/}/actions/runners"
-    elif [[ "${url_path}" == */* ]]; then
-        echo "${api_base}/repos/${url_path}/actions/runners"
-    else
-        echo "${api_base}/orgs/${url_path}/actions/runners"
-    fi
-}
-
-RUNNERS_API_URL="$(resolve_runners_api_url)"
+# Delegated to the shared gh_api_runners_url helper so the heartbeat probe,
+# the init-time registration helpers, and this autoscaler all agree on the
+# URL shape for repo/org/enterprise runners.
+RUNNERS_API_URL="$(gh_api_runners_url "${RUNNER_URL}")"
 
 # ── Runner status query (per-cycle cached) ──────────────────────────────────
 # A single paginated GET /actions/runners fetch per scaling cycle feeds both
@@ -642,33 +692,86 @@ graceful_scale_down() {
 
 # Banner. ASCII '=' only -- balenaCloud's dashboard log viewer mangles
 # Unicode box-drawing characters (U+2550 etc.) into 'a-circumflex' single-
-# byte rendering. Matches the runner heartbeat banner style.
-log "info" "======================================================="
-log "info" "  GitHub Actions Runner Autoscaler"
-log "info" "======================================================="
-log "info" "  Backend      : ${SCALE_BACKEND}"
-log "info" "  Mode         : ${SCALE_MODE}"
-log "info" "  Min replicas : ${SCALE_MIN}"
-log "info" "  Max replicas : ${SCALE_MAX}"
-log "info" "  Interval     : ${SCALE_INTERVAL}s"
-log "info" "  Cooldown     : ${SCALE_COOLDOWN}s"
+# byte rendering. Uses the same shared banner helpers as the runner's
+# HEALTH HEARTBEAT block so all multi-line log blocks look alike.
+banner_top   "info"
+banner_title "info" "GITHUB ACTIONS RUNNER AUTOSCALER"
+banner_thin  "info"
+banner_section "info" "Policy"
+banner_kv "info" "Backend"       "${SCALE_BACKEND}"
+banner_kv "info" "Mode"          "${SCALE_MODE}"
+banner_kv "info" "Min replicas"  "${SCALE_MIN}"
+banner_kv "info" "Max replicas"  "${SCALE_MAX}"
+banner_kv "info" "Interval"      "${SCALE_INTERVAL}s"
+banner_kv "info" "Cooldown"      "${SCALE_COOLDOWN}s"
 if [[ "${SCALE_MODE}" == "auto" ]]; then
-    log "info" "  Scale-up at  : ${SCALE_UP_THRESHOLD}% busy"
-    log "info" "  Scale-down at: ${SCALE_DOWN_THRESHOLD}% busy"
+    banner_kv "info" "Scale-up at"   "${SCALE_UP_THRESHOLD}% busy"
+    banner_kv "info" "Scale-down at" "${SCALE_DOWN_THRESHOLD}% busy"
 fi
-log "info" "  Runner URL   : ${RUNNER_URL}"
+banner_section "info" "Scope"
+banner_kv "info" "Runner URL"    "${RUNNER_URL}"
 if [[ -n "${RUNNER_SCOPE_LABELS}" || -n "${RUNNER_SCOPE_NAME_REGEX}" ]]; then
-    log "info" "  Scope labels : ${RUNNER_SCOPE_LABELS:-<none>}"
-    log "info" "  Scope regex  : ${RUNNER_SCOPE_NAME_REGEX:-<none>}"
+    banner_kv "info" "Scope labels"  "${RUNNER_SCOPE_LABELS:-<none>}"
+    banner_kv "info" "Scope regex"   "${RUNNER_SCOPE_NAME_REGEX:-<none>}"
 else
-    log "info" "  Scope filter : <none> -- counting ALL runners in ${RUNNER_URL}"
+    banner_kv "info" "Scope filter"  "<none> -- counting ALL runners in ${RUNNER_URL}"
 fi
+banner_section "info" "Backend Detail"
 case "${SCALE_BACKEND}" in
-    compose) log "info" "  Compose svc  : ${COMPOSE_SERVICE} (file: ${COMPOSE_FILE})" ;;
-    exec)    log "info" "  Exec cmd     : ${SCALE_EXEC} (supports_remove=${SCALE_EXEC_SUPPORTS_REMOVE})" ;;
-    emit)    log "info" "  Emit file    : ${SCALE_EMIT_FILE}" ;;
+    compose) banner_kv "info" "Compose svc"   "${COMPOSE_SERVICE} (file: ${COMPOSE_FILE})" ;;
+    exec)    banner_kv "info" "Exec cmd"      "${SCALE_EXEC} (supports_remove=${SCALE_EXEC_SUPPORTS_REMOVE})" ;;
+    emit)    banner_kv "info" "Emit file"     "${SCALE_EMIT_FILE}" ;;
 esac
-log "info" "======================================================="
+banner_bottom "info"
+
+# _log_status_banner -- per-cycle status block matching the runner heartbeat
+# shape. Reads loop globals (SCALE_BACKEND, SCALE_MODE, CURRENT, ONLINE,
+# BUSY, IDLE, BUSY_PCT, LAST_SCALE_TIME, NOW). Called once per scaling
+# cycle from both the auto and emit-in-auto paths.
+_log_status_banner() {
+    local cooldown_field="" last_action_field=""
+    if [[ "${SCALE_BACKEND}" != "emit" ]]; then
+        if (( LAST_SCALE_TIME > 0 )); then
+            local since=$(( NOW - LAST_SCALE_TIME ))
+            last_action_field="${since}s ago"
+            if (( since < SCALE_COOLDOWN )); then
+                cooldown_field="$(( SCALE_COOLDOWN - since ))s remaining"
+            else
+                cooldown_field="ready"
+            fi
+        else
+            cooldown_field="ready (no action yet)"
+            last_action_field="never"
+        fi
+    fi
+
+    banner_top   "info"
+    banner_title "info" "AUTOSCALER STATUS (${HOSTNAME:-$(hostname)})"
+    banner_thin  "info"
+    banner_section "info" "Pool"
+    banner_kv "info" "Backend"         "${SCALE_BACKEND}"
+    banner_kv "info" "Mode"            "${SCALE_MODE}"
+    if [[ "${SCALE_BACKEND}" == "emit" ]]; then
+        banner_kv "info" "Replicas"    "${CURRENT} (managed externally; min=${SCALE_MIN} max=${SCALE_MAX})"
+    else
+        banner_kv "info" "Replicas"    "${CURRENT} / max ${SCALE_MAX} (min ${SCALE_MIN})"
+    fi
+    banner_section "info" "Runners"
+    banner_kv "info" "Online"          "${ONLINE}"
+    banner_kv "info" "Busy"            "${BUSY}"
+    banner_kv "info" "Idle"            "${IDLE}"
+    if [[ "${SCALE_MODE}" == "auto" ]]; then
+        banner_kv "info" "Busy Percentage" "${BUSY_PCT}% (up>=${SCALE_UP_THRESHOLD}% / down<=${SCALE_DOWN_THRESHOLD}%)"
+    else
+        banner_kv "info" "Busy Percentage" "${BUSY_PCT}%"
+    fi
+    if [[ "${SCALE_BACKEND}" != "emit" ]]; then
+        banner_section "info" "Scaling"
+        banner_kv "info" "Cooldown"        "${cooldown_field}"
+        banner_kv "info" "Last Action"     "${last_action_field}"
+    fi
+    banner_bottom "info"
+}
 
 # ── Fixed mode: set to MAX and hold ──────────────────────────────────────────
 if [[ "${SCALE_MODE}" == "fixed" ]]; then
@@ -728,7 +831,7 @@ while true; do
         BUSY_PCT=0
     fi
 
-    log "info" "Status: backend=${SCALE_BACKEND} replicas=${CURRENT} online=${ONLINE} busy=${BUSY} idle=${IDLE} busy%=${BUSY_PCT}%"
+    _log_status_banner
 
     # Emit mode: compute the proposed target using ONLINE (since CURRENT=0)
     # and publish state every cycle regardless of cooldown. External systems

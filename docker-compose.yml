@@ -34,6 +34,29 @@ services:
       ON_OFFLINE_ACTION: "restart"
       ONLINE_PROBE_EVERY: "1"
       ONLINE_FAIL_THRESHOLD: "3"
+      IDLE_RECYCLE_ACTION: "shutdown"
+      # IDLE_RECYCLE_AFTER unset on purpose -- the image picks an
+      # ephemeral-aware default:
+      #   RUNNER_EPHEMERAL=true  -> 21600s  (6 hours)
+      #   RUNNER_EPHEMERAL=false -> 172800s (2 days)
+      # Override with e.g. IDLE_RECYCLE_AFTER: "14400" or "0" to disable.
+
+      # ── Runtime tunables (May 2026 refactor) ──
+      # LOG_WATCH_INTERVAL controls how often svc-gh-runner-logs polls for
+      # new workers / log files. Lower = faster JOB STARTED/FINISHED
+      # banners; higher = lower idle CPU wakeups. Range 1-10s.
+      LOG_WATCH_INTERVAL: "2"
+      # Bound the silent busy-waits for Runner.Listener and _diag/. 0 = wait
+      # forever (pre-May-2026 behaviour). Warnings emit every 30s past 30s.
+      LISTENER_WAIT_TIMEOUT: "600"
+      DIAG_WAIT_TIMEOUT: "120"
+      # Hard cap on a single config.sh invocation so a wedged TCP connection
+      # to api.github.com can't hang init forever. 0 = disable wrapper.
+      CONFIG_TIMEOUT: "90"
+      # Set true to keep the runner visible in GitHub across container
+      # restarts (avoid the small window where queued jobs could be lost).
+      # Recommended only for long-lived persistent runners, not ephemeral.
+      SKIP_DEREGISTER: "false"
 
     labels:
       io.balena.features.supervisor-api: '1'

@@ -24,6 +24,28 @@ printf '%s svc-gh-runner[info]: SHUTDOWN signal received -- starting deregistrat
 sync 2>/dev/null || true
 
 log "info" "Runner service stopped (exit code: ${EXIT_CODE}) -- running finish hook"
+
+# Operators with long-lived persistent runners can set SKIP_DEREGISTER=true
+# to keep the runner visible in GitHub across container restarts -- this
+# avoids the few-second window during a restart where jobs queued against
+# this name would otherwise be dispatched to whoever picks them up first.
+case "${SKIP_DEREGISTER:-false}" in
+    true|True|TRUE)
+        log "info" "SKIP_DEREGISTER=true -- skipping GitHub API DELETE / config.sh remove"
+        sync 2>/dev/null || true
+        if [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]]; then
+            log "info" "Ephemeral mode: shutting down container"
+            sync 2>/dev/null || true
+            sleep 0.2
+            exec s6-svscanctl -t /run/service
+        fi
+        if [[ "${EXIT_CODE}" != "0" ]]; then
+            log "warn" "Runner exited abnormally (exit code: ${EXIT_CODE}), s6 will restart"
+        fi
+        exit 0
+        ;;
+esac
+
 log "info" "Will attempt to deregister runner from GitHub before container exit"
 
 # ---------------------------------------------------------------------------

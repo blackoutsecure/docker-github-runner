@@ -78,7 +78,18 @@ COPY --link root/ /
 # -----------------------------------------------------------------------------
 COPY --link scripts/autoscale.sh /usr/local/bin/gh-runner-autoscale
 RUN chmod 0755 /usr/local/bin/gh-runner-autoscale \
-               /usr/local/bin/gh-runner-entrypoint
+               /usr/local/bin/gh-runner-entrypoint && \
+    chmod 0644 /usr/local/bin/log-functions.sh \
+               /usr/local/bin/banner-functions.sh \
+               /usr/local/bin/gh-api.sh \
+               /usr/local/bin/gh-config.sh \
+               /usr/local/bin/gh-runtime.sh \
+               /usr/local/bin/gh-dind.sh \
+               /usr/local/bin/gh-preflight.sh \
+               /usr/local/bin/gh-cleanup.sh \
+               /usr/local/bin/gh-banner.sh \
+               /usr/local/bin/gh-heartbeat.sh \
+               /usr/local/bin/gh-diag.sh
 
 ENV HOME="/config" \
     RUNNER_WORKDIR="/config/work" \
@@ -111,6 +122,11 @@ ENV HOME="/config" \
     CLEANUP_OFFLINE_IMMEDIATE="" \
     HEARTBEAT_INTERVAL="120" \
     JOB_HEARTBEAT_INTERVAL="120" \
+    LOG_WATCH_INTERVAL="2" \
+    LISTENER_WAIT_TIMEOUT="600" \
+    DIAG_WAIT_TIMEOUT="120" \
+    CONFIG_TIMEOUT="90" \
+    SKIP_DEREGISTER="false" \
     FORCE_RUNNER_PERMISSIONS_FIX="false" \
     RUNNER_ROLE="" \
     S6_SERVICES_GRACETIME="30000" \
