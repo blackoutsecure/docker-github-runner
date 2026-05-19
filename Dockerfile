@@ -89,7 +89,13 @@ RUN chmod 0755 /usr/local/bin/gh-runner-autoscale \
                /usr/local/bin/gh-cleanup.sh \
                /usr/local/bin/gh-banner.sh \
                /usr/local/bin/gh-heartbeat.sh \
-               /usr/local/bin/gh-diag.sh
+               /usr/local/bin/gh-diag.sh && \
+    # Defensive: COPY preserves file mode from the host, so a run/finish
+    # script that lost its +x bit (e.g. created on macOS via tooling that
+    # defaults to 0644) would crash s6 with "exec ... Permission denied"
+    # (exit 126). Force-mark every s6 run/finish script executable here.
+    # 0755 because s6-overlay sometimes invokes these as user `abc` not root.
+    find /etc/s6-overlay/s6-rc.d -type f \( -name run -o -name finish \) -exec chmod 0755 {} +
 
 ENV HOME="/config" \
     RUNNER_WORKDIR="/config/work" \
