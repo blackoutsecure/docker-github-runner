@@ -264,15 +264,31 @@ gh_config_resolve_runner_name() {
         RUNNER_NAME_SOURCE="explicit: RUNNER_NAME env"
         log "info" "RUNNER_NAME provided explicitly via env: ${RUNNER_NAME}"
     else
+        # In balena multicontainer fleets, BALENA_SERVICE_NAME is the
+        # service key from docker-compose.yml (e.g. "gh-runner" vs
+        # "gh-runner-warm"). Appending it makes peer services on the
+        # same device get distinct runner names from the very first
+        # registration, sidestepping the dedup race that fires when
+        # both containers query the API simultaneously on cold boot.
+        # RUNNER_NAME_SUFFIX is honored as an explicit override so
+        # operators can force a suffix in non-balena environments
+        # (e.g. plain docker compose with two replicas).
+        local svc_suffix="${RUNNER_NAME_SUFFIX:-${BALENA_SERVICE_NAME:-}}"
+        local suffix_source=""
+        if [[ -n "${RUNNER_NAME_SUFFIX:-}" ]]; then
+            suffix_source="RUNNER_NAME_SUFFIX"
+        elif [[ -n "${BALENA_SERVICE_NAME:-}" ]]; then
+            suffix_source="BALENA_SERVICE_NAME"
+        fi
         if [[ -n "${BALENA_DEVICE_NAME_AT_INIT:-}" ]]; then
-            RUNNER_NAME="${BALENA_DEVICE_NAME_AT_INIT}${BALENA_SERVICE_HANDLE:+-${BALENA_SERVICE_HANDLE}}"
-            RUNNER_NAME_SOURCE="auto: BALENA_DEVICE_NAME_AT_INIT"
+            RUNNER_NAME="${BALENA_DEVICE_NAME_AT_INIT}${svc_suffix:+-${svc_suffix}}"
+            RUNNER_NAME_SOURCE="auto: BALENA_DEVICE_NAME_AT_INIT${suffix_source:+ + ${suffix_source}}"
         elif [[ -n "${RESIN_DEVICE_NAME_AT_INIT:-}" ]]; then
-            RUNNER_NAME="${RESIN_DEVICE_NAME_AT_INIT}${BALENA_SERVICE_HANDLE:+-${BALENA_SERVICE_HANDLE}}"
-            RUNNER_NAME_SOURCE="auto: RESIN_DEVICE_NAME_AT_INIT"
-        elif [[ -n "${BALENA_SERVICE_HANDLE:-}" ]]; then
-            RUNNER_NAME="$(hostname)-${BALENA_SERVICE_HANDLE}"
-            RUNNER_NAME_SOURCE="auto: hostname-BALENA_SERVICE_HANDLE"
+            RUNNER_NAME="${RESIN_DEVICE_NAME_AT_INIT}${svc_suffix:+-${svc_suffix}}"
+            RUNNER_NAME_SOURCE="auto: RESIN_DEVICE_NAME_AT_INIT${suffix_source:+ + ${suffix_source}}"
+        elif [[ -n "${svc_suffix}" ]]; then
+            RUNNER_NAME="$(hostname)-${svc_suffix}"
+            RUNNER_NAME_SOURCE="auto: hostname + ${suffix_source}"
         else
             RUNNER_NAME="$(hostname)"
             RUNNER_NAME_SOURCE="auto: container hostname"

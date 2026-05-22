@@ -32,7 +32,8 @@ param_env_vars:
 # optional env variables
 opt_param_usage_include_env: true
 opt_param_env_vars:
-  - {env_var: "RUNNER_NAME", env_value: "", desc: "Runner name (defaults to container hostname; auto-deduplicated if already online)"}
+  - {env_var: "RUNNER_NAME", env_value: "", desc: "Runner name (defaults to ${BALENA_DEVICE_NAME_AT_INIT}-${BALENA_SERVICE_NAME} in balena fleets, container hostname otherwise; auto-deduplicated if already online)"}
+  - {env_var: "RUNNER_NAME_SUFFIX", env_value: "", desc: "Optional explicit suffix appended to the auto-derived runner name (use to force distinct names for peer replicas outside balena)"}
   - {env_var: "RUNNER_LABELS", env_value: "", desc: "Comma-separated custom labels (e.g. self-hosted,linux,x64,gpu)"}
   - {env_var: "RUNNER_GROUP", env_value: "", desc: "Runner group (org/enterprise only; created via API if missing, defaults to Default)"}
   - {env_var: "RUNNER_WORKDIR", env_value: "/config/work", desc: "Working directory for runner jobs"}

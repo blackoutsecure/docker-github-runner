@@ -568,7 +568,8 @@ docker run -d \
 | `RUNNER_TOKEN` | one of three req'd | Runner registration token (expires 1 h after generation) |
 | `GITHUB_PAT` | one of three req'd | GitHub Personal Access Token — container auto-mints registration tokens via the API |
 | `GITHUB_TOKEN` | one of three req'd | Repo secret or GitHub App token — same auto-mint behaviour as `GITHUB_PAT`, but typically shorter-lived |
-| `RUNNER_NAME` | container hostname | Display name; auto-deduplicated (`-1`, `-2`, …) when an online runner with the same name already exists |
+| `RUNNER_NAME` | container hostname (or `${BALENA_DEVICE_NAME_AT_INIT}-${BALENA_SERVICE_NAME}` in balena fleets) | Display name; auto-deduplicated (`-1`, `-2`, …) when an online runner with the same name already exists |
+| `RUNNER_NAME_SUFFIX` | _(empty)_ | Optional explicit suffix appended to the auto-derived runner name (e.g. set to `warm` on a second replica to force distinct names when not running under balena). Takes precedence over `BALENA_SERVICE_NAME`. |
 | `RUNNER_LABELS` | `self-hosted` | Comma-separated custom labels (e.g. `self-hosted,linux,arm64,gpu`) |
 | `RUNNER_GROUP` | `Default` | Runner group (org / enterprise only); created via API if missing |
 | `RUNNER_WORKDIR` | `/config/work/<runner-name>` | Job working directory. If unset, defaults to a per-runner isolated path derived from `RUNNER_NAME` |
