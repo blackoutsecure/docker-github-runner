@@ -21,6 +21,11 @@ Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app/).
 >
 > The image is *not* an official LinuxServer.io release.
 
+> [!IMPORTANT]
+> This repository is not an official LinuxServer.io image release.
+> Want to help make it an officially supported LinuxServer.io Community image?
+> Add your support in [linuxserver/discussions/128](https://github.com/orgs/linuxserver/discussions/128).
+
 ---
 
 ## Table of Contents
@@ -36,6 +41,11 @@ Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app/).
     - [Persistent runner with `/config` volume](#persistent-runner-with-config-volume)
     - [Recommended: Fixed pool of ephemeral runners](#recommended-fixed-pool-of-ephemeral-runners)
     - [Advanced: Dynamic scaling](#advanced-dynamic-scaling)
+      - [Multiple fleets on one org/repo (arm64 + x64, prod + staging, …)](#multiple-fleets-on-one-orgrepo-arm64--x64-prod--staging-)
+      - [Compose backend (default)](#compose-backend-default)
+      - [Exec backend (orchestrator-agnostic)](#exec-backend-orchestrator-agnostic)
+      - [Emit backend (read-only / external scheduler)](#emit-backend-read-only--external-scheduler)
+      - [Kubernetes](#kubernetes)
     - [Balena deployment](#balena-deployment)
     - [Docker CLI](#docker-cli)
   - [Parameters](#parameters)
@@ -73,6 +83,7 @@ Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app/).
   - [Health monitoring](#health-monitoring)
     - [Docker `HEALTHCHECK`](#docker-healthcheck)
     - [Auto-recovery on disconnection](#auto-recovery-on-disconnection)
+    - [Idle recycle policy](#idle-recycle-policy)
     - [s6 service supervision](#s6-service-supervision)
   - [Logging](#logging-1)
   - [Security considerations](#security-considerations)
