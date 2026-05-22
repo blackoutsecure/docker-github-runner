@@ -502,9 +502,13 @@ When you want the autoscaler to *recommend* a target replica count but not act o
   "current": 0,
   "online": 4,
   "busy": 3,
-  "idle_runner_names": ["runner-aaa", "runner-bbb"]
+  "offline": 2,
+  "idle_runner_names": ["runner-aaa", "runner-bbb"],
+  "offline_runner_names": ["defiant-time-gh-runner-1", "defiant-time-gh-runner-warm-1"]
 }
 ```
+
+`offline` and `offline_runner_names` surface stale registrations (typically dedup-suffix leftovers from a previous boot that crashed before deregistering). The autoscaler does NOT delete them — that's handled by the runner container's init-time [stale offline runner cleanup](#stale-offline-runner-cleanup) sweep, which removes `<RUNNER_NAME>-<digits>` matches immediately when `CLEANUP_SIMILAR_OFFLINE=true` (the default). Surfacing the names in the emit JSON lets external schedulers cross-check or alert on them.
 
 ```yaml
   gh-runner-scaler:
@@ -609,7 +613,7 @@ The `_FILE` variant takes precedence over the plain variant when both are set.
 | --- | --- | --- |
 | `DOCKER_IN_DOCKER` | `false` | Add the runner user to the gid that owns the mounted Docker socket so container-based jobs work |
 | `AUTO_DOCKER_LABEL` | follows `DOCKER_IN_DOCKER` | When `true`, auto-appends a `docker` runner label so workflows can target `runs-on: [self-hosted, docker]` |
-| `DOCKER_HOST_SOCK` | _auto_ | Override the in-container socket path (default: auto-detect `/var/run/docker.sock` then `/var/run/balena-engine.sock`) |
+| `DOCKER_HOST_SOCK` | _auto_ | Override the in-container socket path (default: auto-detect `/var/run/docker.sock` then `/var/run/balena-engine.sock`; the discovered socket is also symlinked into `/var/run/docker.sock` so jobs do not need `DOCKER_HOST` set) |
 
 #### Logging
 
@@ -623,7 +627,7 @@ The `_FILE` variant takes precedence over the plain variant when both are set.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `ONLINE_PROBE_EVERY` | `1` (persistent) / `0` (ephemeral) | Probe the GitHub API for runner status every N heartbeat ticks; `0` disables (requires `GITHUB_PAT` / `GITHUB_TOKEN`) |
+| `ONLINE_PROBE_EVERY` | `1` | Probe the GitHub API for runner status every N heartbeat ticks; `0` disables (requires `GITHUB_PAT` / `GITHUB_TOKEN`). Applies to both ephemeral and persistent mode |
 | `ONLINE_FAIL_THRESHOLD` | `3` | Consecutive offline detections before triggering `ON_OFFLINE_ACTION` |
 | `ON_OFFLINE_ACTION` | `restart` | `none` (log only) \| `restart` (graceful s6 restart) \| `shutdown` (container exits, orchestrator restarts it) |
 | `IDLE_RECYCLE_AFTER` | _ephemeral-aware_: `21600` (6 h) when `RUNNER_EPHEMERAL=true`, `172800` (2 d) otherwise | Recycle the runner after N seconds continuously idle. `0` disables. Minimum when enabled: `300`. The timer **resets when a worker starts** so it never interrupts a running job. See [Idle recycle policy](#idle-recycle-policy) |
@@ -642,6 +646,8 @@ See [Stale offline runner cleanup](#stale-offline-runner-cleanup) for the full d
 | `CLEANUP_OFFLINE_NAME_REGEX` | _empty_ | Optional ERE pattern; only matching runner names are eligible |
 | `CLEANUP_OFFLINE_DRY_RUN` | `false` | Log what would be removed without calling `DELETE` |
 | `CLEANUP_OFFLINE_MAX` | `25` | Safety cap on runners removed per sweep |
+| `CLEANUP_SIMILAR_OFFLINE` | `true` | Companion sweep that removes offline runners whose name matches `^${RUNNER_NAME}-[0-9]+$` (the dedup-suffix scheme produced by this image). Runs immediately, no offline timer. Subject to `CLEANUP_OFFLINE_MAX` / `CLEANUP_OFFLINE_DRY_RUN`. Set to `false` to disable |
+| `CLEANUP_SIMILAR_REQUIRE_LABEL_MATCH` | `true` | When the similar-name sweep runs, an offline candidate is only removed if its label set is identical to `RUNNER_LABELS` (sorted, lowercased, deduped). Protects against cross-architecture peers that re-use the same base hostname. Set to `false` to skip the label guard |
 
 #### Custom packages / init script (escape hatch)
 
@@ -698,7 +704,7 @@ Used by the `gh-runner-scaler` sidecar service (see [Advanced: Dynamic scaling](
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SCALE_EMIT_FILE` | _required_ | Path to write the JSON state file each interval |
+| `SCALE_EMIT_FILE` | `/scaler/state.json` | Path to write the JSON state file each interval. The image pre-creates `/scaler` (mode 0700); override to redirect to a bind-mounted volume shared with a consumer |
 
 ### Volumes
 
@@ -1074,22 +1080,31 @@ services:
 
 Crashed or force-killed containers (SIGKILL, host reboot, power loss) skip the `finish` deregistration hook and leave a runner registered as `offline` in GitHub. Ephemeral fleets are particularly prone to accumulating these ghosts because every container registers under a fresh hostname.
 
-Enable the startup sweep with `CLEANUP_OFFLINE_RUNNERS=true` and a `GITHUB_PAT`/`GITHUB_TOKEN` that carries the same scope used for registration.
+Two complementary sweeps run during the runner container's init phase:
+
+1. **Threshold sweep** (`CLEANUP_OFFLINE_RUNNERS=true`) — removes any offline runner that has been continuously offline for longer than `CLEANUP_OFFLINE_AFTER` seconds. Useful for long-lived fleets where you also want to garbage-collect runners registered by other containers (e.g. ephemeral hash-named runners).
+2. **Similar-name sweep** (`CLEANUP_SIMILAR_OFFLINE=true`, **on by default**) — removes offline runners whose name matches `^${RUNNER_NAME}-[0-9]+$`, i.e. the `-1`, `-2`, … dedup suffix scheme that `gh_api_deduplicate_runner_name` produces when this container's previous boot didn't deregister cleanly. Removed immediately (no offline timer), and only when the offline runner advertises the same label set as the current container would register with (defense against cross-architecture peers re-using a base hostname).
+
+Both sweeps share one paginated `GET /actions/runners` fetch and one DELETE loop, so enabling both adds no extra API cost. Either or both can be disabled independently. Both require a `GITHUB_PAT` / `GITHUB_TOKEN` carrying the same scope used for registration.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CLEANUP_OFFLINE_RUNNERS` | `false` | Master toggle. The sweep is a no-op unless this is `true` and a token is available |
+| `CLEANUP_OFFLINE_RUNNERS` | `false` | Master toggle for the threshold sweep. The sweep is a no-op unless this is `true` and a token is available |
 | `CLEANUP_OFFLINE_IMMEDIATE` | _auto_ | When `true`, bypass the offline-since timer. Auto-resolves to `true` when `RUNNER_EPHEMERAL=true` (offline ephemeral runners never reconnect), `false` otherwise |
 | `CLEANUP_OFFLINE_AFTER` | `86400` | Seconds a runner must be continuously offline before removal in threshold mode (minimum `300`). Persisted via `/config/.gh-runner-offline-state.json` so brief reboots don't reset the timer |
-| `CLEANUP_OFFLINE_NAME_REGEX` | _empty_ | Optional ERE pattern to scope the sweep (e.g. `^aada` to limit cleanup to ephemeral hash-named runners) |
-| `CLEANUP_OFFLINE_DRY_RUN` | `false` | When `true`, log what would be removed without calling `DELETE`. **Recommended for the first deploy** |
-| `CLEANUP_OFFLINE_MAX` | `25` | Safety cap on removals per startup sweep |
+| `CLEANUP_OFFLINE_NAME_REGEX` | _empty_ | Optional ERE pattern to scope the threshold sweep (e.g. `^aada` to limit cleanup to ephemeral hash-named runners) |
+| `CLEANUP_OFFLINE_DRY_RUN` | `false` | When `true`, log what would be removed without calling `DELETE`. **Recommended for the first deploy**. Applies to BOTH sweeps |
+| `CLEANUP_OFFLINE_MAX` | `25` | Safety cap on removals per startup sweep. Combined cap across both sweeps |
+| `CLEANUP_SIMILAR_OFFLINE` | `true` | Master toggle for the similar-name sweep. Default `true` because a `<RUNNER_NAME>-<digits>` registration is unambiguously a leftover from a previous boot of this same service. Set to `false` to disable |
+| `CLEANUP_SIMILAR_REQUIRE_LABEL_MATCH` | `true` | When `true`, the similar-name sweep only removes an offline candidate if its label set matches the current `RUNNER_LABELS` (sorted + lowercased + deduped, including auto-injected system labels like `Linux` / `ARM64` / `X64`). Set to `false` if your fleet legitimately re-uses the same base name across heterogeneous label sets |
 
 **Built-in safety**
 
 - The runner this container is about to register is always excluded from the victim set.
-- All deletions are logged with name, id, and offline duration so the action is auditable in `docker logs`.
-- Preflight validates the regex (jq compile check), the threshold value, and `/config` writability before any DELETE.
+- The similar-name sweep regex is anchored (`^…$`) and metacharacter-escapes `RUNNER_NAME`, so a name like `runner.local` won't accidentally widen the match.
+- The similar-name label guard compares sorted/lowercased/deduped label sets — an arm64 offline runner registered with `ARM64` is NOT eligible for cleanup by an x64 sibling whose `RUNNER_LABELS` resolves to `X64`.
+- All deletions are logged with name, id, and reason (`offline 86400s` for threshold hits, `similar-name leftover of '<RUNNER_NAME>'` for similar hits) so the action is auditable in `docker logs`.
+- Preflight validates the threshold value, the optional regex (jq compile check), and `/config` writability before any DELETE.
 
 **Recommended config — ephemeral fleet**
 
@@ -1101,15 +1116,28 @@ environment:
   # CLEANUP_OFFLINE_IMMEDIATE=true   # implicit when ephemeral
   # CLEANUP_OFFLINE_DRY_RUN=true     # try this first
   - CLEANUP_OFFLINE_MAX=25
+  # CLEANUP_SIMILAR_OFFLINE=true     # default; no need to set
 ```
 
-**Recommended config — persistent fleet (24 h grace)**
+**Recommended config — persistent fleet (24 h grace + dedup leftovers)**
 
 ```yaml
 environment:
   - GITHUB_PAT=ghp_xxx
   - CLEANUP_OFFLINE_RUNNERS=true
   - CLEANUP_OFFLINE_AFTER=86400
+  # CLEANUP_SIMILAR_OFFLINE=true     # default; sweeps `<name>-1`, `<name>-2` …
+```
+
+**Recommended config — similar-name sweep only (no threshold)**
+
+For fleets that don't want to garbage-collect arbitrary offline runners but DO want to clear their own dedup-suffix leftovers (`defiant-time-gh-runner-1`, etc., visible in the autoscaler status banner under `Offline names`):
+
+```yaml
+environment:
+  - GITHUB_PAT=ghp_xxx
+  # CLEANUP_OFFLINE_RUNNERS deliberately left false
+  # CLEANUP_SIMILAR_OFFLINE=true     # default
 ```
 
 ## Health monitoring

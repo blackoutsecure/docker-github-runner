@@ -55,7 +55,7 @@ opt_param_env_vars:
   - {env_var: "HEARTBEAT_INTERVAL", env_value: "120", desc: "Seconds between heavyweight HEALTH HEARTBEAT log banners. Minimum 30."}
   - {env_var: "JOB_HEARTBEAT_INTERVAL", env_value: "120", desc: "Seconds between mid-job JOB HEARTBEAT log banners (only while a job is running). 0 disables; minimum 30 when enabled."}
   - {env_var: "FORCE_RUNNER_PERMISSIONS_FIX", env_value: "false", desc: "Force a defensive `chown -R abc:abc /opt/runner-bin` at startup, bypassing the build-time ownership marker. Useful after a manual chown changed file ownership."}
-  - {env_var: "ONLINE_PROBE_EVERY", env_value: "1", desc: "Verify runner is online with GitHub every N heartbeats; 0 disables (requires GITHUB_PAT or GITHUB_TOKEN)"}
+  - {env_var: "ONLINE_PROBE_EVERY", env_value: "1", desc: "Verify runner is online with GitHub every N heartbeats; 0 disables (requires GITHUB_PAT or GITHUB_TOKEN). Default applies to ephemeral mode too -- needed for ON_OFFLINE_ACTION to fire when an idle listener silently disconnects"}
   - {env_var: "ONLINE_FAIL_THRESHOLD", env_value: "3", desc: "Consecutive offline detections before triggering ON_OFFLINE_ACTION"}
   - {env_var: "ON_OFFLINE_ACTION", env_value: "restart", desc: "Action when offline threshold trips: none | restart (s6-svc -r) | shutdown (container exit)"}
   - {env_var: "IDLE_RECYCLE_AFTER", env_value: "(ephemeral-aware default)", desc: "Recycle runner after N seconds continuously idle. Defaults: 21600 (6 h) when RUNNER_EPHEMERAL=true, 172800 (2 d) when false. 0 disables; values 1..299 are clamped to 300. Timer resets when a worker starts so it never interrupts a job."}

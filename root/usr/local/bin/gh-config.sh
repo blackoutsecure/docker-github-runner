@@ -144,10 +144,16 @@ resolve_idle_recycle_defaults() { gh_config_resolve_idle_recycle "$@"; }
 #
 # ONLINE_PROBE_EVERY: how often (in heartbeat ticks) to actively probe
 #   GitHub for runner online status.
-#   Ephemeral mode default: 0 (disabled -- ephemeral runners complete
-#       a job and exit before any active probe would fire; listener
-#       liveness is enough).
-#   Persistent mode default: 1 (every tick).
+#   Default: 1 (every tick), for both ephemeral and persistent mode.
+#   Rationale: the disconnect-detection story (ON_OFFLINE_ACTION,
+#       /healthcheck staleness, restart-on-offline) is only useful when
+#       a probe is actually firing. Production-grade ephemeral runners
+#       almost always run with `restart: always` + a warm spare so the
+#       listener does sit idle between jobs and CAN go offline silently;
+#       disabling the probe there blinds the recovery path. Set to 0
+#       to opt out (e.g. single-shot ephemerals with no restart policy,
+#       or to avoid the small GitHub API call cost when no
+#       GITHUB_PAT/GITHUB_TOKEN is available).
 #
 # ONLINE_FAIL_THRESHOLD: consecutive offline detections before escalating.
 #   Default 3.
@@ -174,11 +180,7 @@ gh_config_resolve_heartbeat() {
         JOB_HEARTBEAT_INTERVAL=30
     fi
 
-    if [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]]; then
-        ONLINE_PROBE_EVERY="${ONLINE_PROBE_EVERY:-0}"
-    else
-        ONLINE_PROBE_EVERY="${ONLINE_PROBE_EVERY:-1}"
-    fi
+    ONLINE_PROBE_EVERY="${ONLINE_PROBE_EVERY:-1}"
 
     ONLINE_FAIL_THRESHOLD="${ONLINE_FAIL_THRESHOLD:-3}"
     ON_OFFLINE_ACTION="${ON_OFFLINE_ACTION:-restart}"

@@ -30,7 +30,8 @@
 #                        External systems (GitHub Actions cron, balena-cli
 #                        from a workstation, an Argo/Tekton pipeline) consume
 #                        the file and apply the scaling action however they
-#                        like. Required env: SCALE_EMIT_FILE=<path>.
+#                        like. Optional env: SCALE_EMIT_FILE=<path>
+#                        (defaults to /scaler/state.json).
 #
 # Required environment variables (always):
 #   RUNNER_URL      — GitHub repo/org/enterprise URL
@@ -75,7 +76,7 @@
 #                                 `remove <name>...` for graceful scale-down.
 #
 # Emit backend (SCALE_BACKEND=emit):
-#   SCALE_EMIT_FILE — Required. Path to write JSON state file.
+#   SCALE_EMIT_FILE — Default /scaler/state.json. Path to write JSON state file.
 #
 # Usage:
 #   Typically run as a compose service — see the Autoscaling section in README.md.
@@ -112,7 +113,11 @@ COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 SCALE_EXEC="${SCALE_EXEC:-}"
 SCALE_EXEC_SUPPORTS_REMOVE="${SCALE_EXEC_SUPPORTS_REMOVE:-false}"
 # Emit backend
-SCALE_EMIT_FILE="${SCALE_EMIT_FILE:-}"
+# Default to /scaler/state.json -- the Dockerfile pre-creates /scaler
+# with mode 0700 so this Just Works without any extra compose config
+# when SCALE_BACKEND=emit. Override to redirect to a bind-mounted
+# volume shared with a workflow / sidecar that consumes the state.
+SCALE_EMIT_FILE="${SCALE_EMIT_FILE:-/scaler/state.json}"
 # Per-fleet scope filters
 RUNNER_SCOPE_LABELS="${RUNNER_SCOPE_LABELS:-}"
 RUNNER_SCOPE_NAME_REGEX="${RUNNER_SCOPE_NAME_REGEX:-}"
@@ -244,6 +249,13 @@ case "${SCALE_BACKEND}" in
         fi
         ;;
     emit)
+        # SCALE_EMIT_FILE has a built-in default of /scaler/state.json
+        # (see defaults block above) so the empty-string fatal would be
+        # dead code -- but we still need to fail fast if an operator
+        # explicitly cleared it via `-e SCALE_EMIT_FILE=` (which the
+        # `${VAR:-default}` form would NOT catch had they passed it as
+        # an arg that bash sees as unset; defensive check kept for
+        # cases where the default block is bypassed).
         if [[ -z "${SCALE_EMIT_FILE}" ]]; then
             log "fatal" "SCALE_BACKEND=emit requires SCALE_EMIT_FILE=<path>"
             exit 1
@@ -455,17 +467,35 @@ refresh_runners_cache() {
     RUNNERS_JSON_CACHE="${fresh}"
 }
 
-# Echoes "online busy" from the cache.
+# Echoes "online busy offline" from the cache. `offline` is the count of
+# runners whose GitHub-reported status is "offline" within the in-scope
+# fleet -- typically stale registrations from earlier boots that crashed
+# before deregistering (SIGKILL, host reboot, balena replace). The
+# autoscaler does NOT delete them itself (that's the runner container's
+# init-time `cleanup_stale_offline_runners` job), but it surfaces the
+# count + names so operators can see them in the status banner and the
+# emit-mode JSON state file consumed by external orchestrators.
 cached_runner_counts() {
-    local online busy
-    online="$(jq '[ .[] | select(.status == "online") ] | length' <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null || echo 0)"
-    busy="$(jq   '[ .[] | select(.status == "online" and .busy == true) ] | length' <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null || echo 0)"
-    echo "${online} ${busy}"
+    local online busy offline
+    online="$(jq  '[ .[] | select(.status == "online") ] | length' <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null || echo 0)"
+    busy="$(jq    '[ .[] | select(.status == "online" and .busy == true) ] | length' <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null || echo 0)"
+    offline="$(jq '[ .[] | select(.status == "offline") ] | length' <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null || echo 0)"
+    echo "${online} ${busy} ${offline}"
 }
 
 # Newline-separated names of online + idle (busy=false) runners.
 cached_idle_runner_names() {
     jq -r '.[] | select(.status == "online" and .busy == false) | .name' \
+        <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null
+}
+
+# Newline-separated names of offline runners (any name, any labels within
+# the active scope filter). Surfaced in the status banner and emit JSON
+# so operators can spot dedup-suffix leftovers (e.g. `defiant-time-gh-runner-1`
+# lingering after a SIGKILL'd previous boot). The runner container's init
+# stage handles the actual DELETE via `cleanup_stale_offline_runners`.
+cached_offline_runner_names() {
+    jq -r '.[] | select(.status == "offline") | .name' \
         <<< "${RUNNERS_JSON_CACHE}" 2>/dev/null
 }
 
@@ -575,10 +605,16 @@ _exec_remove_by_names() {
 # each cycle. Dispatchers below handle emit with inline no-ops, so there are
 # no `_emit_get_current_replicas`-style stubs to maintain.
 _emit_state() {
-    local target="$1" current="$2" online="$3" busy="$4" idle_names="$5"
+    local target="$1" current="$2" online="$3" busy="$4" idle_names="$5" offline="${6:-0}" offline_names="${7:-}"
     local idle_json='[]'
     if [[ -n "${idle_names}" ]]; then
         idle_json="$(printf '%s\n' "${idle_names}" \
+            | awk 'NF' \
+            | jq -R . | jq -s . 2>/dev/null || echo '[]')"
+    fi
+    local offline_json='[]'
+    if [[ -n "${offline_names}" ]]; then
+        offline_json="$(printf '%s\n' "${offline_names}" \
             | awk 'NF' \
             | jq -R . | jq -s . 2>/dev/null || echo '[]')"
     fi
@@ -591,7 +627,9 @@ _emit_state() {
   "current": ${current},
   "online": ${online},
   "busy": ${busy},
-  "idle_runner_names": ${idle_json}
+  "offline": ${offline},
+  "idle_runner_names": ${idle_json},
+  "offline_runner_names": ${offline_json}
 }
 JSON
     mv -f "${tmp}" "${SCALE_EMIT_FILE}"
@@ -760,6 +798,10 @@ _log_status_banner() {
     banner_kv "info" "Online"          "${ONLINE}"
     banner_kv "info" "Busy"            "${BUSY}"
     banner_kv "info" "Idle"            "${IDLE}"
+    banner_kv "info" "Offline"         "${OFFLINE:-0}"
+    if [[ "${OFFLINE:-0}" -gt 0 && -n "${OFFLINE_NAMES_PREVIEW:-}" ]]; then
+        banner_kv "info" "Offline names"   "${OFFLINE_NAMES_PREVIEW}"
+    fi
     if [[ "${SCALE_MODE}" == "auto" ]]; then
         banner_kv "info" "Busy Percentage" "${BUSY_PCT}% (up>=${SCALE_UP_THRESHOLD}% / down<=${SCALE_DOWN_THRESHOLD}%)"
     else
@@ -784,8 +826,9 @@ if [[ "${SCALE_MODE}" == "fixed" ]]; then
         if [[ "${SCALE_BACKEND}" == "emit" ]]; then
             # Emit mode: publish state every cycle. No replica enforcement.
             if refresh_runners_cache; then
-                read -r ONLINE BUSY <<< "$(cached_runner_counts)"
-                _emit_state "${SCALE_MAX}" 0 "${ONLINE}" "${BUSY}" "$(cached_idle_runner_names)"
+                read -r ONLINE BUSY OFFLINE <<< "$(cached_runner_counts)"
+                OFFLINE_NAMES_FIXED="$(cached_offline_runner_names)"
+                _emit_state "${SCALE_MAX}" 0 "${ONLINE}" "${BUSY}" "$(cached_idle_runner_names)" "${OFFLINE}" "${OFFLINE_NAMES_FIXED}"
             fi
             # refresh_runners_cache logs its own detailed diagnostic on
             # failure; no generic skip-cycle warning needed here.
@@ -817,8 +860,19 @@ while true; do
     fi
 
     CURRENT="$(backend_get_current_replicas)"
-    read -r ONLINE BUSY <<< "$(cached_runner_counts)"
+    read -r ONLINE BUSY OFFLINE <<< "$(cached_runner_counts)"
     IDLE=$((ONLINE - BUSY))
+    OFFLINE_NAMES="$(cached_offline_runner_names)"
+    # Build a short comma-separated preview for the status banner (first
+    # 5 names; truncate long lists with an ellipsis count). The full list
+    # still goes into the emit JSON for downstream tooling.
+    OFFLINE_NAMES_PREVIEW=""
+    if [[ "${OFFLINE}" -gt 0 && -n "${OFFLINE_NAMES}" ]]; then
+        OFFLINE_NAMES_PREVIEW="$(printf '%s\n' "${OFFLINE_NAMES}" | awk 'NF' | head -n 5 | paste -sd ',' -)"
+        if [[ "${OFFLINE}" -gt 5 ]]; then
+            OFFLINE_NAMES_PREVIEW="${OFFLINE_NAMES_PREVIEW} (+$((OFFLINE - 5)) more)"
+        fi
+    fi
 
     # Calculate busy percentage (avoid division by zero). In emit mode CURRENT
     # is always 0, so fall back to ONLINE as the denominator so the threshold
@@ -844,7 +898,7 @@ while true; do
             TARGET_FOR_EMIT=$(( ONLINE - 1 ))
         fi
         TARGET_FOR_EMIT="$(clamp "${TARGET_FOR_EMIT}" "${SCALE_MIN}" "${SCALE_MAX}")"
-        _emit_state "${TARGET_FOR_EMIT}" "${CURRENT}" "${ONLINE}" "${BUSY}" "$(cached_idle_runner_names)"
+        _emit_state "${TARGET_FOR_EMIT}" "${CURRENT}" "${ONLINE}" "${BUSY}" "$(cached_idle_runner_names)" "${OFFLINE}" "${OFFLINE_NAMES}"
         continue
     fi
 
