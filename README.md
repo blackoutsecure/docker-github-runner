@@ -2,35 +2,30 @@
   <img src="https://raw.githubusercontent.com/blackoutsecure/docker-github-runner/main/logo.png" alt="github logo" width="200">
 </p>
 
-# docker-github-runner
+# blackoutsecure/github-runner
 
-[![GitHub Stars](https://img.shields.io/github/stars/blackoutsecure/docker-github-runner.svg?style=flat-square)](https://github.com/blackoutsecure/docker-github-runner/stargazers)
-[![Docker Pulls](https://img.shields.io/docker/pulls/blackoutsecure/github-runner.svg?style=flat-square)](https://hub.docker.com/r/blackoutsecure/github-runner)
-[![GitHub Release](https://img.shields.io/github/release/blackoutsecure/docker-github-runner.svg?style=flat-square)](https://github.com/blackoutsecure/docker-github-runner/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/blackoutsecure/docker-github-runner?style=flat-square&color=E7931D&logo=github)](https://github.com/blackoutsecure/docker-github-runner/stargazers)
+[![Docker Pulls](https://img.shields.io/docker/pulls/blackoutsecure/github-runner?style=flat-square&color=E7931D&logo=docker&logoColor=FFFFFF)](https://hub.docker.com/r/blackoutsecure/github-runner)
+[![GitHub Release](https://img.shields.io/github/release/blackoutsecure/docker-github-runner.svg?style=flat-square&color=E7931D&logo=github&logoColor=FFFFFF)](https://github.com/blackoutsecure/docker-github-runner/releases)
 [![Blackout Secure Launchpad](https://img.shields.io/github/actions/workflow/status/blackoutsecure/docker-github-runner/bos-launchpad.yml?style=flat-square&label=blackout%20secure%20launchpad&color=E7931D)](https://github.com/blackoutsecure/docker-github-runner/actions/workflows/bos-launchpad.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-Unofficial community container image for the [GitHub Actions Runner](https://github.com/actions/runner), built with s6-overlay supervision, hardened runtime defaults, multi-arch (amd64 / arm64) builds, and first-class Balena deployment support.
-
-Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app/).
-
-> **Image & Listings**
-> - **Docker Hub image:** [`blackoutsecure/github-runner`](https://hub.docker.com/r/blackoutsecure/github-runner)
-> - **Balena Marketplace:** [github-runner](https://hub.balena.io/blocks/2362920/github-runner)
-> - **GitHub repository:** [`blackoutsecure/docker-github-runner`](https://github.com/blackoutsecure/docker-github-runner)
->
-> The image is *not* an official LinuxServer.io release.
+Unofficial community image for the [GitHub Actions Runner](https://github.com/actions/runner), built with [LinuxServer.io](https://linuxserver.io/) style container patterns (s6-overlay supervision, hardened defaults, multi-arch amd64 / arm64 builds) and first-class Balena deployment support. Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app).
 
 > [!IMPORTANT]
 > This repository is not an official LinuxServer.io image release.
 > Want to help make it an officially supported LinuxServer.io Community image?
 > Add your support in [linuxserver/discussions/128](https://github.com/orgs/linuxserver/discussions/128).
 
+Links: [Docker Hub](https://hub.docker.com/r/blackoutsecure/github-runner) · [Balena block](https://hub.balena.io/blocks/2362920/github-runner) · [GitHub](https://github.com/blackoutsecure/docker-github-runner) · [Upstream Runner](https://github.com/actions/runner)
+
+[![balena deploy button](https://www.balena.io/deploy.svg)](https://hub.balena.io/blocks/2362920/github-runner)
+
 ---
 
 ## Table of Contents
 
-- [docker-github-runner](#docker-github-runner)
+- [blackoutsecure/github-runner](#blackoutsecuregithub-runner)
   - [Table of Contents](#table-of-contents)
   - [Quick Start](#quick-start)
   - [Image Availability](#image-availability)
