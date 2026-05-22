@@ -52,3 +52,53 @@ tmp/
 !build/
 !scripts/
 !Dockerfile
+
+# >>> bos-automation-hub:docker >>>
+# Managed by https://github.com/blackoutsecure/bos-automation-hub — do not edit between markers.
+# CI / automation metadata — not needed inside the Docker build context.
+.git
+.github/
+.gitignore
+.gitattributes
+.dockerignore
+.editorconfig
+
+# Editor / IDE noise
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+._*
+
+# Documentation / metadata (if your image legitimately needs one of
+# these inside the runtime, add a `!README.md` style re-include AFTER
+# this managed block — `.dockerignore` is last-match-wins, so a
+# re-include placed BEFORE the block would be overridden by these
+# excludes).
+README.md
+LICENSE
+SECURITY.md
+CHANGELOG.md
+
+# Local env / secrets — NEVER ship inside an image.
+.env
+.env.*
+.secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+# <<< bos-automation-hub:docker <<<
+
+# >>> bos-automation-hub:balena >>>
+# Managed by https://github.com/blackoutsecure/bos-automation-hub — do not edit between markers.
+# `balena.yml` is rendered by the bos-automation-hub workflow into the
+# repo root before `balena push` runs; @balena/compose reads it from the
+# build context, so it MUST NOT be excluded.
+!balena.yml
+# <<< bos-automation-hub:balena <<<
