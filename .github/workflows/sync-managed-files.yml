@@ -1,0 +1,37 @@
+# Caller for the hub's `sync-managed-files.yml` reusable.
+#
+# Keeps `root/usr/local/bin/log-functions.sh` in sync with the canonical
+# `logger` whole-file service in the hub. The hub owns the entire file
+# body — local edits will be reverted on the next run.
+#
+# To extend this to also sync `.gitignore` / `.dockerignore` / etc.,
+# add `common`, `docker`, etc. on additional lines under `services:`.
+# Those services use section-mode and won't touch any text outside the
+# `# >>> bos-automation-hub:<service> >>>` markers.
+
+name: Sync managed files
+
+on:
+  schedule:
+    - cron: '35 13 * * 1'   # Monday 13:35 UTC — stagger off :00
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sync-managed-files.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-managed-files-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    permissions:
+      contents: write   # required to push the canonical content back
+    uses: blackoutsecure/bos-automation-hub/.github/workflows/sync-managed-files.yml@main
+    with:
+      services: |
+        logger
