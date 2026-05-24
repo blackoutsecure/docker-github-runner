@@ -9,6 +9,7 @@
 [![GitHub Release](https://img.shields.io/github/release/blackoutsecure/docker-github-runner.svg?style=flat-square&color=E7931D&logo=github&logoColor=FFFFFF)](https://github.com/blackoutsecure/docker-github-runner/releases)
 [![Blackout Secure Launchpad](https://img.shields.io/github/actions/workflow/status/blackoutsecure/docker-github-runner/bos-launchpad.yml?style=flat-square&label=blackout%20secure%20launchpad&color=E7931D)](https://github.com/blackoutsecure/docker-github-runner/actions/workflows/bos-launchpad.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+[![Made by BlackoutSecure](https://img.shields.io/badge/made%20by-BlackoutSecure-1f1f1f?style=flat-square)](https://github.com/blackoutsecure)
 
 Unofficial community image for the [GitHub Actions Runner](https://github.com/actions/runner), built with [LinuxServer.io](https://linuxserver.io/) style container patterns (s6-overlay supervision, hardened defaults, multi-arch amd64 / arm64 builds) and first-class Balena deployment support. Sponsored and maintained by [Blackout Secure](https://blackoutsecure.app).
 
