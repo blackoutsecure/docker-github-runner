@@ -7,7 +7,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/blackoutsecure/docker-github-runner?style=flat-square&color=E7931D&logo=github)](https://github.com/blackoutsecure/docker-github-runner/stargazers)
 [![Docker Pulls](https://img.shields.io/docker/pulls/blackoutsecure/github-runner?style=flat-square&color=E7931D&logo=docker&logoColor=FFFFFF)](https://hub.docker.com/r/blackoutsecure/github-runner)
 [![GitHub Release](https://img.shields.io/github/release/blackoutsecure/docker-github-runner.svg?style=flat-square&color=E7931D&logo=github&logoColor=FFFFFF)](https://github.com/blackoutsecure/docker-github-runner/releases)
-[![Blackout Secure Launchpad](https://img.shields.io/github/actions/workflow/status/blackoutsecure/docker-github-runner/bos-launchpad.yml?style=flat-square&label=blackout%20secure%20launchpad&color=E7931D)](https://github.com/blackoutsecure/docker-github-runner/actions/workflows/bos-launchpad.yml)
+[![Blackout Secure Launchpad](https://img.shields.io/github/actions/workflow/status/blackoutsecure/docker-github-runner/bos-launchpad-release.yml?style=flat-square&label=blackout%20secure%20launchpad&color=E7931D)](https://github.com/blackoutsecure/docker-github-runner/actions/workflows/bos-launchpad-release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Made by BlackoutSecure](https://img.shields.io/badge/made%20by-BlackoutSecure-1f1f1f?style=flat-square)](https://github.com/blackoutsecure)
 
@@ -1315,10 +1315,10 @@ For ephemeral fleets, expect ~3–10 s of one-time setup per container before th
 ## Release & versioning
 
 - **Versioning** — tags follow the upstream [`actions/runner`](https://github.com/actions/runner) release version (e.g. `2.333.1`).
-- **Build pipeline** — [`.github/workflows/bos-launchpad.yml`](.github/workflows/bos-launchpad.yml) is the sole workflow in this repo. It thin-wraps the [`bos-launchpad.yml`](https://github.com/blackoutsecure/bos-automation-hub/blob/main/.github/workflows/bos-launchpad.yml) reusable meta-workflow in [`blackoutsecure/bos-automation-hub`](https://github.com/blackoutsecure/bos-automation-hub), which runs monitor → docker → balena → github-release end-to-end. Triggers: 6-hourly cron (upstream-gated), push to `main` on `Dockerfile` / `root/**` / `build/**` / `docker-compose.yml` / `README.md` / `.github/upstream/**` / the workflow itself, and manual `workflow_dispatch` (with a `force_run` flag).
+- **Build pipeline** — [`.github/workflows/bos-launchpad-release.yml`](.github/workflows/bos-launchpad-release.yml) is the sole workflow in this repo. It thin-wraps the [`bos-launchpad-release.yml`](https://github.com/blackoutsecure/bos-automation-hub/blob/main/.github/workflows/bos-launchpad-release.yml) reusable meta-workflow in [`blackoutsecure/bos-automation-hub`](https://github.com/blackoutsecure/bos-automation-hub), which runs monitor → docker → balena → github-release end-to-end. Triggers: 6-hourly cron (upstream-gated), push to `main` on `Dockerfile` / `root/**` / `build/**` / `docker-compose.yml` / `README.md` / `.github/upstream/**` / the workflow itself, and manual `workflow_dispatch` (with a `force_run` flag).
 - **Multi-arch builds** — `linux/amd64` + `linux/arm64` via `docker buildx`; the registry tag is a multi-arch manifest list.
 - **Image tags** — `:latest`, `:<runner-version>`, `:<runner-version>-<short-vcs-ref>`, `:sha-<short-git-sha>`.
-- **Balena block** — `balena.yml` is **not** checked in; the hub renders it on each run from the inputs in [`bos-launchpad.yml`](.github/workflows/bos-launchpad.yml). A local `balena push <fleet-slug>` deploys the published image (via [`docker-compose.yml`](docker-compose.yml)) and does not need `balena.yml`.
+- **Balena block** — `balena.yml` is **not** checked in; the hub renders it on each run from the inputs in [`bos-launchpad-release.yml`](.github/workflows/bos-launchpad-release.yml). A local `balena push <fleet-slug>` deploys the published image (via [`docker-compose.yml`](docker-compose.yml)) and does not need `balena.yml`.
 
 ```bash
 docker pull blackoutsecure/github-runner:latest   # rolling
