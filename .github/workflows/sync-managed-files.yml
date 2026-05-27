@@ -1,5 +1,17 @@
 # Caller for the hub's `sync-managed-files.yml` reusable.
 #
+# ---------------------------------------------------------------------------
+# RETIREMENT NOTICE (staged for removal in a follow-up commit):
+# ---------------------------------------------------------------------------
+# The `bos_launchpad_sync_files` service below replaces this entire
+# hand-authored caller with a hub-managed kicker at
+# `.github/workflows/bos-launchpad-sync-files.yml`. The next scheduled
+# run of this caller will write that kicker. Once the new kicker is
+# verified working in this repo, DELETE this file — the kicker reads
+# the `sync_files:` block in `.bos-launchpad.yaml` at the repo root
+# and supersedes this caller entirely.
+# ---------------------------------------------------------------------------
+#
 # Keeps managed dotfile sections (`.gitignore`, `.dockerignore`,
 # `.editorconfig`, `.gitattributes`) AND canonical whole files
 # (`root/usr/local/bin/log-functions.sh`) in sync with the hub. Section
@@ -41,3 +53,4 @@ jobs:
         balena
         logger
         lf_line_endings
+        bos_launchpad_sync_files
