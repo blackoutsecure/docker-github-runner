@@ -225,10 +225,8 @@ services:
       - S6_KILL_GRACETIME=30000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # optional: container-based jobs
-    security_opt:
-      - no-new-privileges:true
     cap_drop: [ ALL ]
-    cap_add: [ CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER ]
+    cap_add: [ CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, AUDIT_WRITE ]
     tmpfs:
       - /run:exec,size=64m
       - /tmp:exec,size=2g,mode=1777
@@ -577,7 +575,7 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   --cap-drop ALL \
   --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
-  --cap-add DAC_OVERRIDE --cap-add FOWNER \
+  --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add AUDIT_WRITE \
   --tmpfs /tmp:exec,size=2g,mode=1777 \
   --stop-timeout 30 \
   blackoutsecure/github-runner:latest
@@ -892,7 +890,7 @@ The image is designed to run with the **minimum** privileges that still let s6-o
 | Requirement | Value | Why |
 | --- | --- | --- |
 | Container user (PID 1) | `root` | s6-overlay init scripts need root to chown `/run` and drop to `abc` |
-| Linux capabilities | `CHOWN`, `SETUID`, `SETGID`, `DAC_OVERRIDE`, `FOWNER` | s6-overlay ownership / privilege drop |
+| Linux capabilities | `CHOWN`, `SETUID`, `SETGID`, `DAC_OVERRIDE`, `FOWNER`, `AUDIT_WRITE` | s6-overlay ownership / privilege drop; `AUDIT_WRITE` lets `sudo` emit kernel audit records (omit and `sudo` still works but prints a benign "unable to send audit message" warning to stderr) |
 | `security_opt` | _none by default_ (see note) | `no-new-privileges=true` blocks setuid escalation, but it is mutually exclusive with the default `RUNNER_SUDO=true` (sudo is a setuid binary and refuses to elevate when `PR_SET_NO_NEW_PRIVS` is set). Opt in **only** alongside `RUNNER_SUDO=false`. |
 | `cap_drop` | `ALL` (then re-add the five above) | Drops every other capability |
 | Tmpfs | `/run`, `/tmp`, `/var/log` (sized per workload) | s6 service state, job scratch, supervisor logs |

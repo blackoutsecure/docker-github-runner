@@ -74,6 +74,13 @@ services:
       - SETGID
       - DAC_OVERRIDE
       - FOWNER
+      # AUDIT_WRITE: lets sudo emit a single audit record per syscall to
+      # the kernel audit subsystem. Without it sudo still works but
+      # prints a benign "unable to send audit message: Operation not
+      # permitted" warning to stderr on every invocation, which trips
+      # workflow log scanners. Default-Docker hands this to every
+      # container; `ubuntu-latest` has it.
+      - AUDIT_WRITE
     tmpfs:
       - /run:exec,size=64m
       - /tmp:exec,size=2g,mode=1777

@@ -185,7 +185,10 @@ readonly_message: |
 
   For a hardened posture, use the defaults already shipped with the image:
 
-  - `cap_drop: [ ALL ]` plus only `CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER`
+  - `cap_drop: [ ALL ]` plus only `CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, AUDIT_WRITE`
+    (`AUDIT_WRITE` lets `sudo` emit kernel audit records without
+    printing a benign "unable to send audit message: Operation not
+    permitted" warning to stderr on every invocation)
   - tmpfs at `/run`, `/tmp`, `/var/log` so log/scratch data lives in volatile memory
   - `RUNNER_EPHEMERAL=true` so any one container only handles one job before being recreated
   - pin the image tag (`:<runner-version>` or `:sha-<commit>`) and audit upgrades
