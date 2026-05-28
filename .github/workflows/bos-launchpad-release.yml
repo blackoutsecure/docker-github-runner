@@ -150,19 +150,33 @@ jobs:
         Upstream application: https://github.com/actions/runner
 
       # ---- Consolidated security scan (advisory) ---------------------
-      # CodeQL covers the workflow YAML in `.github/workflows/`
-      # (`actions`). The shell-script payload under `root/` is covered
-      # by the kit composite's bundled shellcheck. Skipped on
-      # `schedule` since source doesn't change between upstream-version
-      # polls. Findings surface in the Security tab but never block
-      # docker/balena.
+      # The shell-script payload under `root/` is covered by the kit
+      # composite's bundled shellcheck. Skipped on `schedule` since
+      # source doesn't change between upstream-version polls. Findings
+      # surface in the Security tab but never block docker/balena.
+      #
+      # CodeQL coverage of the workflow YAML (`actions` language) is
+      # delegated to GitHub's first-party **default setup** (Settings →
+      # Code security → Code scanning → CodeQL → Default setup). GitHub
+      # disallows running an advanced CodeQL workflow against a repo
+      # that has default setup enabled — the SARIF upload from the
+      # advanced path fails with:
+      #
+      #   CodeQL analyses from advanced configurations cannot be
+      #   processed when the default setup is enabled
+      #
+      # So we explicitly skip the launchpad's CodeQL leg here
+      # (`security_scan_codeql_languages: ''`) and let default setup
+      # own the `actions` analysis. The launchpad's kit composite
+      # (posture / actionlint / gitleaks / shellcheck) still runs and
+      # uploads under its own SARIF category, independent of CodeQL.
       enable_security_scan:               ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.stage_security_scan) }}
       security_scan_fail_on:              never
       security_scan_enable_kit_composite: true
       security_scan_enable_posture:       true
       security_scan_enable_scanners:      true
       security_scan_enable_upload:        true
-      security_scan_codeql_languages:     '["actions"]'
+      security_scan_codeql_languages:     ''
       security_scan_codeql_queries:       security-and-quality
       security_scan_use_advanced_pat:     ${{ github.event_name != 'workflow_dispatch' || inputs.security_scan_use_advanced_pat }}
     secrets:
