@@ -106,9 +106,16 @@ docker run -d \
   -e RUNNER_URL=https://github.com/OWNER/REPO \
   -e RUNNER_TOKEN=YOUR_REGISTRATION_TOKEN \
   -v runner-config:/config \
-  --security-opt no-new-privileges:true \
   blackoutsecure/github-runner:latest
 ```
+
+> **Note** — `--security-opt no-new-privileges:true` is intentionally
+> omitted. It is incompatible with the image's default
+> `RUNNER_SUDO=true` (the kernel `PR_SET_NO_NEW_PRIVS` bit blocks sudo
+> from elevating regardless of `/etc/sudoers.d/`), and turning it on
+> without also setting `RUNNER_SUDO=false` breaks every workflow step
+> that runs `sudo apt-get install …`. See [Privileges required by
+> feature](#privileges-required-by-feature) for the full trade-off.
 
 Then `docker logs gh-runner` should show a startup banner ending with `Listening for Jobs`.
 
@@ -178,13 +185,23 @@ services:
     volumes:
       - /path/to/runner/config:/config
       - /var/run/docker.sock:/var/run/docker.sock   # optional: container-based jobs
-    security_opt:
-      - no-new-privileges:true
     tmpfs:
       - /tmp:exec,size=2g,mode=1777
     stop_grace_period: 30s
     restart: unless-stopped
 ```
+
+> **`security_opt: [ no-new-privileges:true ]` is NOT shipped by
+> default.** The image defaults to `RUNNER_SUDO=true` (NOPASSWD sudo
+> for the `abc` runner user) so workflows can `sudo apt-get install
+> …` like on GitHub-hosted runners. The kernel `PR_SET_NO_NEW_PRIVS`
+> bit blocks setuid binaries from elevating, so combining the two
+> produces `sudo: The "no new privileges" flag is set, which prevents
+> sudo from running as root.` on every workflow step that invokes
+> sudo. To opt into the extra hardening, set `RUNNER_SUDO=false`
+> *and* add `security_opt: [ no-new-privileges:true ]`. See
+> [Privileges required by feature](#privileges-required-by-feature)
+> for the full table.
 
 ### Ephemeral runners
 
@@ -220,7 +237,7 @@ services:
     restart: always
 ```
 
-> **About `read_only: true`** — the runner writes its registration state into `/opt/runner-bin`, so a blanket `read_only: true` breaks startup. For a hardened posture, rely on `no-new-privileges:true`, `cap_drop: ALL` plus the minimum capability set, and tmpfs for `/run`, `/tmp`, `/var/log`.
+> **About `read_only: true`** — the runner writes its registration state into `/opt/runner-bin`, so a blanket `read_only: true` breaks startup. For a hardened posture, rely on `cap_drop: ALL` plus the minimum capability set, and tmpfs for `/run`, `/tmp`, `/var/log`. `no-new-privileges:true` is also available but **only** in combination with `RUNNER_SUDO=false` — with the default `RUNNER_SUDO=true` it silently breaks every `sudo apt-get install …` step.
 
 ### Persistent runner with `/config` volume
 
@@ -558,7 +575,6 @@ docker run -d \
   -e RUNNER_NAME=my-runner \
   -v /path/to/runner/config:/config \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  --security-opt no-new-privileges:true \
   --cap-drop ALL \
   --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
   --cap-add DAC_OVERRIDE --cap-add FOWNER \
@@ -566,6 +582,13 @@ docker run -d \
   --stop-timeout 30 \
   blackoutsecure/github-runner:latest
 ```
+
+> **Note on `--security-opt no-new-privileges:true`** — omitted from
+> the example above because the image defaults to `RUNNER_SUDO=true`
+> (NOPASSWD sudo for the runner user, matching `ubuntu-latest`). The
+> two are mutually exclusive at the kernel level. Operators who want
+> the extra hardening must also pass `-e RUNNER_SUDO=false` so the
+> image stops advertising sudo it can't actually grant.
 
 ## Parameters
 
@@ -870,7 +893,7 @@ The image is designed to run with the **minimum** privileges that still let s6-o
 | --- | --- | --- |
 | Container user (PID 1) | `root` | s6-overlay init scripts need root to chown `/run` and drop to `abc` |
 | Linux capabilities | `CHOWN`, `SETUID`, `SETGID`, `DAC_OVERRIDE`, `FOWNER` | s6-overlay ownership / privilege drop |
-| `security_opt` | `no-new-privileges=true` | Block setuid escalation inside the container |
+| `security_opt` | _none by default_ (see note) | `no-new-privileges=true` blocks setuid escalation, but it is mutually exclusive with the default `RUNNER_SUDO=true` (sudo is a setuid binary and refuses to elevate when `PR_SET_NO_NEW_PRIVS` is set). Opt in **only** alongside `RUNNER_SUDO=false`. |
 | `cap_drop` | `ALL` (then re-add the five above) | Drops every other capability |
 | Tmpfs | `/run`, `/tmp`, `/var/log` (sized per workload) | s6 service state, job scratch, supervisor logs |
 | Egress | `https://api.github.com`, `https://github.com`, `https://*.actions.githubusercontent.com` | Registration, listener long-poll, artifact / log upload |

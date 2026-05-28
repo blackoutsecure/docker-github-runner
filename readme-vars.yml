@@ -156,8 +156,11 @@ app_setup_block: |
 
   **Read-only rootfs**: `read_only: true` is not supported out of the box (the
   runner writes registration state to `/opt/runner-bin`). For a hardened posture
-  rely on `no-new-privileges:true`, `cap_drop: ALL` plus the minimum capability
-  set, and tmpfs for `/run`, `/tmp`, `/var/log`.
+  rely on `cap_drop: ALL` plus the minimum capability set, and tmpfs for `/run`,
+  `/tmp`, `/var/log`. `no-new-privileges:true` is also available but **only** in
+  combination with `RUNNER_SUDO=false` — with the default `RUNNER_SUDO=true` it
+  silently breaks every `sudo apt-get install …` step (PR_SET_NO_NEW_PRIVS
+  blocks sudo, a setuid binary, from elevating).
 
   **Filesystem layout**: The runner runs directly out of `/opt/runner-bin`,
   which is the directory `config.sh` / `run.sh` write `.runner`,
@@ -182,11 +185,13 @@ readonly_message: |
 
   For a hardened posture, use the defaults already shipped with the image:
 
-  - `security_opt: [ no-new-privileges:true ]`
   - `cap_drop: [ ALL ]` plus only `CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER`
   - tmpfs at `/run`, `/tmp`, `/var/log` so log/scratch data lives in volatile memory
   - `RUNNER_EPHEMERAL=true` so any one container only handles one job before being recreated
   - pin the image tag (`:<runner-version>` or `:sha-<commit>`) and audit upgrades
+  - `security_opt: [ no-new-privileges:true ]` is available as belt-and-braces
+    hardening but **only** alongside `RUNNER_SUDO=false` — it is mutually
+    exclusive with the image's default NOPASSWD sudo for the runner user
 
 # non-root support
 nonroot_supported: true
