@@ -28,7 +28,11 @@ RUN apt-get update && \
         libicu74 \
         libssl3t64 \
         lsb-release \
+        nodejs \
+        npm \
         python3 \
+        python3-pip \
+        shellcheck \
         sudo \
         unzip \
         xz-utils \
@@ -45,7 +49,7 @@ RUN apt-get update && \
         docker-compose-plugin && \
     apt-get purge -y --auto-remove gnupg lsb-release && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.npm /root/.cache
 
 COPY --link build/ /tmp/build/
 RUN /tmp/build/install-runner.sh && \
