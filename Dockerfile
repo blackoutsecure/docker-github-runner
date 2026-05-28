@@ -42,11 +42,23 @@ RUN apt-get update && \
     chmod a+r /etc/apt/keyrings/docker.asc && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME}") stable" \
         > /etc/apt/sources.list.d/docker.list && \
+    # GitHub CLI (`gh`). Mirrors the docker-ce-cli apt-repo pattern above.
+    # Required by org workflows that call `gh api`, `gh release create`,
+    # `gh workflow run`, etc. on the self-hosted runner (e.g.
+    # bos-marketplace-kit `release.yml` preflight + publish steps).
+    # cli.github.com serves a binary GPG keyring (`.gpg`), not an ASCII-
+    # armored key, so the keyring file extension differs from docker's.
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         docker-ce-cli \
         docker-buildx-plugin \
-        docker-compose-plugin && \
+        docker-compose-plugin \
+        gh && \
     apt-get purge -y --auto-remove gnupg lsb-release && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.npm /root/.cache
