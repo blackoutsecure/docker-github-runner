@@ -1,0 +1,36 @@
+# =============================================================================
+# Grant the LSIO `abc` user (uid 911) passwordless sudo.
+#
+# Why this exists
+# ---------------
+# The github-actions runner service drops to the unprivileged `abc` user
+# (see root/etc/s6-overlay/s6-rc.d/svc-gh-runner/run -- it execs the listener
+# under `s6-setuidgid abc`). All job steps therefore run as `abc`, NOT root.
+#
+# That mirrors the GitHub-hosted ubuntu-latest convention, where the runner
+# user is `runner` (non-root) and has unrestricted NOPASSWD sudo via
+# /etc/sudoers.d/runner. A huge swath of the GHA ecosystem -- official
+# actions, third-party actions, and ad-hoc `run:` blocks alike -- assumes
+# `sudo apt-get install ...` Just Works. Without this drop-in, every such
+# workflow fails with `sudo: command not found` (exit 127) or
+# `abc is not in the sudoers file` (exit 1).
+#
+# Threat model
+# ------------
+# This is a *self-hosted* runner image; the operator has already chosen to
+# execute arbitrary GHA workloads inside it. Granting `abc` NOPASSWD sudo
+# does not meaningfully expand the trust boundary -- a malicious workflow
+# step can already exfiltrate any in-container secret, persist files, and
+# initiate outbound network calls. The container boundary (and any
+# orchestrator-level network/volume policy) is the real enforcement point.
+# This is the same posture GitHub themselves use on their hosted fleet.
+#
+# File-mode requirement
+# ---------------------
+# sudoers.d files MUST be mode 0440 (owned root:root) or sudo refuses to
+# parse them with "/etc/sudoers.d/X is mode 0644, should be 0440". The
+# Dockerfile chmods this file to 0440 explicitly after the COPY because
+# Docker's COPY preserves the host file mode, which on macOS / non-root
+# tooling is typically 0644.
+# =============================================================================
+abc ALL=(ALL) NOPASSWD: ALL

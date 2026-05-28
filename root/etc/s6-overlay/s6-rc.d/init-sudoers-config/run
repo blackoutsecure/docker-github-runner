@@ -1,0 +1,106 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# Conditionally remove the baked-in NOPASSWD sudoers drop-in for the LSIO
+# `abc` user based on the RUNNER_SUDO env var. Runs as root before any of
+# the other init oneshots so EXTRA_INIT_SCRIPT can rely on the final
+# sudo state.
+#
+# Why opt-OUT rather than opt-IN
+# ------------------------------
+# The drop-in is baked into the image at build time (mode 0440, root:root,
+# `visudo -c`-checked) so the default deployment matches the GitHub-hosted
+# `ubuntu-latest` convention: the runner user has unrestricted NOPASSWD
+# sudo and `sudo apt-get install ...` Just Works. The vast majority of
+# GHA workflows and third-party actions assume this. Defaulting to OFF
+# would silently break a huge swath of the ecosystem with confusing
+# `sudo: command not found` (exit 127) / `not in the sudoers file`
+# errors, with no log telling the operator what changed.
+#
+# Operators who want a locked-down runner can set:
+#   RUNNER_SUDO=false   (anything other than the truthy set below)
+# and this script removes the drop-in. The `sudo` binary itself stays
+# in the image (cheap, ~5MB, and removing it would break this script's
+# own resilience to repeated reconfiguration).
+#
+# Truthy values (case-insensitive): 1, true, yes, on, enable, enabled
+# Anything else is treated as disabled.
+#
+# Idempotent: safe to run on every container start. The s6 init system
+# re-runs oneshots only when the container restarts; this script handles
+# both "drop-in present, keep it" and "drop-in absent, recreate it"
+# transitions so flipping RUNNER_SUDO between deploys works without an
+# image rebuild.
+#
+set -uo pipefail
+
+# shellcheck disable=SC1091
+. /usr/local/bin/log-functions.sh
+LOG_TAG="init-sudoers-config"
+
+SUDOERS_FILE="/etc/sudoers.d/10-abc-nopasswd"
+SUDOERS_CONTENT='abc ALL=(ALL) NOPASSWD: ALL'
+
+# Normalize: trim whitespace and lowercase. Whitespace-only values from a
+# stripped-out compose template ("   ") behave as unset (i.e. enabled).
+_strip() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "${s}"; }
+RUNNER_SUDO_RAW="$(_strip "${RUNNER_SUDO:-true}")"
+RUNNER_SUDO_LC="${RUNNER_SUDO_RAW,,}"
+
+case "${RUNNER_SUDO_LC}" in
+    ''|1|true|yes|on|enable|enabled)
+        # Enabled (default). Ensure the drop-in exists with the correct
+        # content/owner/mode every boot -- self-heals if a previous
+        # session deleted or chmod'd it, and survives base-image upgrades
+        # that might ship their own /etc/sudoers.d entries.
+        if [[ ! -f "${SUDOERS_FILE}" ]] \
+           || ! grep -qxF "${SUDOERS_CONTENT}" "${SUDOERS_FILE}" 2>/dev/null; then
+            log "info" "sudo enabled (RUNNER_SUDO='${RUNNER_SUDO_RAW}'); (re)installing ${SUDOERS_FILE}"
+            # Write to a temp file first, validate with visudo -c, then
+            # atomically move into place. A malformed drop-in would
+            # otherwise lock the abc user out of sudo silently until the
+            # next workflow tried to use it.
+            tmpfile="$(mktemp /etc/sudoers.d/.10-abc-nopasswd.XXXXXX)"
+            printf '%s\n' "${SUDOERS_CONTENT}" > "${tmpfile}"
+            chown root:root "${tmpfile}"
+            chmod 0440 "${tmpfile}"
+            if ! visudo -c -f "${tmpfile}" >/dev/null 2>&1; then
+                log "error" "visudo -c rejected the generated drop-in; leaving sudo state unchanged"
+                rm -f "${tmpfile}"
+                exit 1
+            fi
+            mv -f "${tmpfile}" "${SUDOERS_FILE}"
+        else
+            # Re-assert mode/ownership in case a bind-mount or earlier
+            # tampering left them wrong. sudo refuses files that aren't
+            # 0440 root:root, so getting this wrong silently disables
+            # sudo despite the file being present.
+            chown root:root "${SUDOERS_FILE}"
+            chmod 0440 "${SUDOERS_FILE}"
+            log "debug" "sudo enabled; ${SUDOERS_FILE} present and matches expected content"
+        fi
+        ;;
+    0|false|no|off|disable|disabled)
+        # Disabled. Remove the drop-in if present so `abc` falls back to
+        # the system default (no sudo access). The `sudo` binary stays
+        # installed -- removing it would force a full image rebuild to
+        # re-enable later.
+        if [[ -f "${SUDOERS_FILE}" ]]; then
+            log "info" "sudo disabled (RUNNER_SUDO='${RUNNER_SUDO_RAW}'); removing ${SUDOERS_FILE}"
+            rm -f "${SUDOERS_FILE}"
+        else
+            log "debug" "sudo disabled; ${SUDOERS_FILE} already absent"
+        fi
+        ;;
+    *)
+        # Unknown value. Fail loudly rather than silently picking a
+        # default that might be the opposite of what the operator
+        # intended (e.g. typo "ture" -> would have been "default true",
+        # but "disable_me" -> would have been "default true" too). Both
+        # outcomes are confusing without a clear log line.
+        log "error" "RUNNER_SUDO='${RUNNER_SUDO_RAW}' is not a recognised boolean. Use one of: true|false|1|0|yes|no|on|off|enable|disable|enabled|disabled. Refusing to start to avoid silent misconfiguration."
+        exit 1
+        ;;
+esac
+
+exit 0

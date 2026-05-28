@@ -657,6 +657,7 @@ See [Stale offline runner cleanup](#stale-offline-runner-cleanup) for the full d
 | `EXTRA_PACKAGES` | Space-separated `apt` packages installed as root before the runner starts. Names validated against `^[a-z0-9][a-z0-9+.\-]+$`. Repeated production use → build a custom image instead |
 | `EXTRA_APT_REPOS` | Semicolon-separated `sources.list` lines added before installing `EXTRA_PACKAGES` |
 | `EXTRA_INIT_SCRIPT` | Path inside the container to a shell script (typically bind-mounted **read-only**) executed as root before the runner starts. Rejected if world-writable. **Do not** point this at a job-writable path |
+| `RUNNER_SUDO` | Default `true`. When truthy, drops `abc ALL=(ALL) NOPASSWD: ALL` into `/etc/sudoers.d/10-abc-nopasswd` (mode 0440, root:root, `visudo -c`-validated) at startup so the runner user gets passwordless sudo — matching the GitHub-hosted `ubuntu-latest` convention that most workflows and third-party actions assume. Set to `false` to remove the drop-in for a locked-down runner; the `sudo` binary stays installed so you can re-enable later without an image rebuild. Accepts `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`/`enable`/`disable` (case-insensitive). Unknown values fail the container start with an explicit error rather than silently picking a default |
 
 #### Process / shutdown
 
@@ -887,6 +888,7 @@ Notably **`NET_ADMIN`, `SYS_ADMIN`, and `SYS_PTRACE` are never required**.
 | `RUNNER_ENV_FILE` / `RUNNER_SECRETS_DIR` | none | mounted file/dir readable by uid 911 | none |
 | `EXTRA_PACKAGES` / `EXTRA_APT_REPOS` | PID 1 = root | egress to apt mirrors; rootfs writable | none |
 | `EXTRA_INIT_SCRIPT` | PID 1 = root; rejected if world-writable | script bind-mounted **read-only** outside any job-writable path | none |
+| `RUNNER_SUDO=true` (default) | `abc` uid 911 gets NOPASSWD sudo to root | none | none |
 | `DOCKER_IN_DOCKER=true` | PID 1 = root (for `usermod` group fixup) | engine socket bind-mount (or Balena `balena-socket` feature) | none |
 | `DOCKER_IN_DOCKER=true` + non-root | none in-container | chosen uid must be a member of host docker gid (`group_add` or `user: "911:<docker-gid>"`) | none |
 | `ONLINE_PROBE_EVERY` (with API check) | none | none | read-only flavour of registration scope (classic `repo` / `admin:org`; fine-grained read) |
