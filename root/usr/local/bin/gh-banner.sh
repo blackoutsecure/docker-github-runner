@@ -125,6 +125,7 @@ gh_banner_emit() {
     echo "    Offline After    : ${CLEANUP_OFFLINE_AFTER:-86400}s"
     echo "    Immediate Mode   : ${CLEANUP_OFFLINE_IMMEDIATE:-(auto: $( [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]] && echo true || echo false ))}"
     echo "    Name Regex       : $(show_or_unset "${CLEANUP_OFFLINE_NAME_REGEX:-}")"
+    echo "    Any-Name Sweep   : ${CLEANUP_OFFLINE_ANY_NAME:-false} (after ${CLEANUP_OFFLINE_ANY_NAME_AFTER:-604800}s, threshold-mode only)"
     echo "    Dry Run          : ${CLEANUP_OFFLINE_DRY_RUN:-false}"
     echo "    Max Per Sweep    : ${CLEANUP_OFFLINE_MAX:-25}"
     echo "${THIN}"

@@ -668,6 +668,8 @@ See [Stale offline runner cleanup](#stale-offline-runner-cleanup) for the full d
 | `CLEANUP_OFFLINE_NAME_REGEX` | _empty_ | Optional ERE pattern; only matching runner names are eligible |
 | `CLEANUP_OFFLINE_DRY_RUN` | `false` | Log what would be removed without calling `DELETE` |
 | `CLEANUP_OFFLINE_MAX` | `25` | Safety cap on runners removed per sweep |
+| `CLEANUP_OFFLINE_ANY_NAME` | `false` | Master toggle for an independent any-name age-gated sweep. When `true`, removes ANY offline runner (any name, any labels) older than `CLEANUP_OFFLINE_ANY_NAME_AFTER` seconds. Always threshold-mode (ignores `CLEANUP_OFFLINE_IMMEDIATE` and `CLEANUP_OFFLINE_NAME_REGEX`). Subject to `CLEANUP_OFFLINE_MAX` / `CLEANUP_OFFLINE_DRY_RUN` |
+| `CLEANUP_OFFLINE_ANY_NAME_AFTER` | `604800` | Seconds of continuous offline required for the any-name sweep. Default 7 d; hard floor `86400` (24 h) — values below the floor are clamped to `86400` with a warning |
 | `CLEANUP_SIMILAR_OFFLINE` | `true` | Companion sweep that removes offline runners whose name matches `^${RUNNER_NAME}-[0-9]+$` (the dedup-suffix scheme produced by this image). Runs immediately, no offline timer. Subject to `CLEANUP_OFFLINE_MAX` / `CLEANUP_OFFLINE_DRY_RUN`. Set to `false` to disable |
 | `CLEANUP_SIMILAR_REQUIRE_LABEL_MATCH` | `true` | When the similar-name sweep runs, an offline candidate is only removed if its label set is identical to `RUNNER_LABELS` (sorted, lowercased, deduped). Protects against cross-architecture peers that re-use the same base hostname. Set to `false` to skip the label guard |
 
@@ -1108,8 +1110,9 @@ Two complementary sweeps run during the runner container's init phase:
 
 1. **Threshold sweep** (`CLEANUP_OFFLINE_RUNNERS=true`) — removes any offline runner that has been continuously offline for longer than `CLEANUP_OFFLINE_AFTER` seconds. Useful for long-lived fleets where you also want to garbage-collect runners registered by other containers (e.g. ephemeral hash-named runners).
 2. **Similar-name sweep** (`CLEANUP_SIMILAR_OFFLINE=true`, **on by default**) — removes offline runners whose name matches `^${RUNNER_NAME}-[0-9]+$`, i.e. the `-1`, `-2`, … dedup suffix scheme that `gh_api_deduplicate_runner_name` produces when this container's previous boot didn't deregister cleanly. Removed immediately (no offline timer), and only when the offline runner advertises the same label set as the current container would register with (defense against cross-architecture peers re-using a base hostname).
+3. **Any-name sweep** (`CLEANUP_OFFLINE_ANY_NAME=true`, **off by default**) — removes every offline runner (any name, any labels) that has been continuously offline for longer than `CLEANUP_OFFLINE_ANY_NAME_AFTER` seconds (default 7 d, hard floor 24 h). Independent of `CLEANUP_OFFLINE_RUNNERS` and `CLEANUP_OFFLINE_NAME_REGEX`, always in threshold-mode (immediate mode does not apply). Use this when you already scope the threshold sweep to your own runners via `CLEANUP_OFFLINE_NAME_REGEX` but still want a name-agnostic 7d+ janitor for stragglers registered by anyone else.
 
-Both sweeps share one paginated `GET /actions/runners` fetch and one DELETE loop, so enabling both adds no extra API cost. Either or both can be disabled independently. Both require a `GITHUB_PAT` / `GITHUB_TOKEN` carrying the same scope used for registration.
+All sweeps share one paginated `GET /actions/runners` fetch and one DELETE loop, so enabling any combination adds no extra API cost. Each can be disabled independently. All require a `GITHUB_PAT` / `GITHUB_TOKEN` carrying the same scope used for registration.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -1117,8 +1120,10 @@ Both sweeps share one paginated `GET /actions/runners` fetch and one DELETE loop
 | `CLEANUP_OFFLINE_IMMEDIATE` | _auto_ | When `true`, bypass the offline-since timer. Auto-resolves to `true` when `RUNNER_EPHEMERAL=true` (offline ephemeral runners never reconnect), `false` otherwise |
 | `CLEANUP_OFFLINE_AFTER` | `86400` | Seconds a runner must be continuously offline before removal in threshold mode (minimum `300`). Persisted via `/config/.gh-runner-offline-state.json` so brief reboots don't reset the timer |
 | `CLEANUP_OFFLINE_NAME_REGEX` | _empty_ | Optional ERE pattern to scope the threshold sweep (e.g. `^aada` to limit cleanup to ephemeral hash-named runners) |
-| `CLEANUP_OFFLINE_DRY_RUN` | `false` | When `true`, log what would be removed without calling `DELETE`. **Recommended for the first deploy**. Applies to BOTH sweeps |
-| `CLEANUP_OFFLINE_MAX` | `25` | Safety cap on removals per startup sweep. Combined cap across both sweeps |
+| `CLEANUP_OFFLINE_ANY_NAME` | `false` | Master toggle for the any-name sweep. When `true`, removes ANY offline runner older than `CLEANUP_OFFLINE_ANY_NAME_AFTER` seconds, independent of `CLEANUP_OFFLINE_NAME_REGEX` and `CLEANUP_OFFLINE_IMMEDIATE`. Always threshold-mode |
+| `CLEANUP_OFFLINE_ANY_NAME_AFTER` | `604800` | Seconds of continuous offline required for the any-name sweep. Default 7 d. **Hard floor `86400` (24 h)** — lower values are clamped to `86400` with a warning. Shares `/config/.gh-runner-offline-state.json` with the threshold sweep |
+| `CLEANUP_OFFLINE_DRY_RUN` | `false` | When `true`, log what would be removed without calling `DELETE`. **Recommended for the first deploy**. Applies to ALL sweeps |
+| `CLEANUP_OFFLINE_MAX` | `25` | Safety cap on removals per startup sweep. Combined cap across ALL sweeps |
 | `CLEANUP_SIMILAR_OFFLINE` | `true` | Master toggle for the similar-name sweep. Default `true` because a `<RUNNER_NAME>-<digits>` registration is unambiguously a leftover from a previous boot of this same service. Set to `false` to disable |
 | `CLEANUP_SIMILAR_REQUIRE_LABEL_MATCH` | `true` | When `true`, the similar-name sweep only removes an offline candidate if its label set matches the current `RUNNER_LABELS` (sorted + lowercased + deduped, including auto-injected system labels like `Linux` / `ARM64` / `X64`). Set to `false` if your fleet legitimately re-uses the same base name across heterogeneous label sets |
 
@@ -1127,8 +1132,10 @@ Both sweeps share one paginated `GET /actions/runners` fetch and one DELETE loop
 - The runner this container is about to register is always excluded from the victim set.
 - The similar-name sweep regex is anchored (`^…$`) and metacharacter-escapes `RUNNER_NAME`, so a name like `runner.local` won't accidentally widen the match.
 - The similar-name label guard compares sorted/lowercased/deduped label sets — an arm64 offline runner registered with `ARM64` is NOT eligible for cleanup by an x64 sibling whose `RUNNER_LABELS` resolves to `X64`.
-- All deletions are logged with name, id, and reason (`offline 86400s` for threshold hits, `similar-name leftover of '<RUNNER_NAME>'` for similar hits) so the action is auditable in `docker logs`.
-- Preflight validates the threshold value, the optional regex (jq compile check), and `/config` writability before any DELETE.
+- All deletions are logged with name, id, and reason (`offline 86400s` for threshold hits, `offline Ns (any-name sweep)` for any-name hits, `similar-name leftover of '<RUNNER_NAME>'` for similar hits) so the action is auditable in `docker logs`.
+- Preflight validates the threshold value, the any-name floor (`CLEANUP_OFFLINE_ANY_NAME_AFTER` >= 86400), the optional regex (jq compile check), and `/config` writability before any DELETE.
+- The any-name sweep ignores `CLEANUP_OFFLINE_IMMEDIATE` on purpose — it would convert a name-agnostic janitor into a fleet-wide mass-delete on the next brief disconnect. Threshold mode only.
+- Victim de-duplication priority across sweeps is `threshold > any-name > similar` so the per-victim log line picks the most-specific reason when a runner qualifies for more than one sweep.
 
 **Recommended config — ephemeral fleet**
 
@@ -1151,6 +1158,25 @@ environment:
   - CLEANUP_OFFLINE_RUNNERS=true
   - CLEANUP_OFFLINE_AFTER=86400
   # CLEANUP_SIMILAR_OFFLINE=true     # default; sweeps `<name>-1`, `<name>-2` …
+```
+
+**Recommended config — scoped fleet + any-name 7 d janitor**
+
+Use this when you already scope your aggressive sweep to your own runners via `CLEANUP_OFFLINE_NAME_REGEX` (e.g. so an ephemeral fleet immediately reaps its own ghosts) but ALSO want a name-agnostic 7 d+ janitor to garbage-collect orphaned runners that anyone else registered into the same org / repo:
+
+```yaml
+environment:
+  - RUNNER_EPHEMERAL=true
+  - GITHUB_PAT=ghp_xxx
+  # Pass A: immediate reap of own ghosts (scoped by name)
+  - CLEANUP_OFFLINE_RUNNERS=true
+  - CLEANUP_OFFLINE_IMMEDIATE=true
+  - CLEANUP_OFFLINE_NAME_REGEX=^gh-runner
+  # Pass C: name-agnostic 7d+ janitor (floor enforced at 86400s)
+  - CLEANUP_OFFLINE_ANY_NAME=true
+  # CLEANUP_OFFLINE_ANY_NAME_AFTER=604800   # default 7d; raise for more conservative GC, e.g. 1209600 (14d)
+  - CLEANUP_OFFLINE_MAX=25
+  # CLEANUP_OFFLINE_DRY_RUN=true            # try this first the first time you enable any-name
 ```
 
 **Recommended config — similar-name sweep only (no threshold)**

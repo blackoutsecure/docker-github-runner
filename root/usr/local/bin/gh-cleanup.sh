@@ -20,6 +20,34 @@
 #   CLEANUP_OFFLINE_MAX         hard cap per sweep (default: 25)
 #   CLEANUP_OFFLINE_IMMEDIATE   skip the timer (default: auto = true for ephemeral)
 #
+# Additional independent sweep (runs on the same fetched listing):
+#   CLEANUP_OFFLINE_ANY_NAME    master toggle for an unconditional any-name
+#                               age-gated sweep. When "true", every offline
+#                               runner that has been continuously offline
+#                               for >= CLEANUP_OFFLINE_ANY_NAME_AFTER seconds
+#                               is eligible for removal regardless of the
+#                               Pass A name-regex scoping or IMMEDIATE
+#                               setting. Designed for the common case
+#                               "garbage-collect any runner that has been
+#                               dead for >24 h, no matter who registered it".
+#                               Default: false.
+#   CLEANUP_OFFLINE_ANY_NAME_AFTER
+#                               seconds offline before Pass C eligibility
+#                               (default 604800 = 7d, floor 86400 = 24h).
+#                               The floor is a hard 24 h on purpose --
+#                               this sweep is name-agnostic and we never
+#                               want a typo to turn it into a 5-minute
+#                               mass-delete. The default is intentionally
+#                               higher than the floor (7d) because an
+#                               any-name sweep can also catch runners
+#                               registered by *other* services in the
+#                               same org/repo; 7d is the industry-standard
+#                               "unambiguously dead" window and gives
+#                               legitimate-but-rarely-used runners room
+#                               to come back from a long maintenance gap.
+#                               Threshold mode only; CLEANUP_OFFLINE_IMMEDIATE
+#                               does NOT apply to this pass.
+#
 # Companion sweep (runs in the same function on the same fetched listing):
 #   CLEANUP_SIMILAR_OFFLINE     remove offline runners whose name matches
 #                               the dedup-suffix pattern derived from this
@@ -59,13 +87,17 @@ clean_local_runner_config() {
 # Top-level sweep -- no-op unless CLEANUP_OFFLINE_RUNNERS=true and a token
 # is present. See module header for tunables.
 cleanup_stale_offline_runners() {
-    # Both sweeps share the same fetched runners listing and the same
-    # DELETE loop. Either or both can be disabled independently.
-    local do_threshold="false" do_similar="false"
+    # All sweeps share the same fetched runners listing and the same
+    # DELETE loop. Each can be disabled independently.
+    local do_threshold="false" do_similar="false" do_anyname="false"
     [[ "${CLEANUP_OFFLINE_RUNNERS:-false}" == "true" ]] && do_threshold="true"
     case "${CLEANUP_SIMILAR_OFFLINE:-true}" in
         true|TRUE|1|yes|on) do_similar="true" ;;
         *)                  do_similar="false" ;;
+    esac
+    case "${CLEANUP_OFFLINE_ANY_NAME:-false}" in
+        true|TRUE|1|yes|on) do_anyname="true" ;;
+        *)                  do_anyname="false" ;;
     esac
     # Similar-name sweep requires a known RUNNER_NAME (resolved by
     # gh_config_resolve_runner_name earlier in init). Without one we have
@@ -74,7 +106,7 @@ cleanup_stale_offline_runners() {
         log "debug" "Stale-runner cleanup: CLEANUP_SIMILAR_OFFLINE=true but RUNNER_NAME is unset; skipping similar-name pass"
         do_similar="false"
     fi
-    if [[ "${do_threshold}" == "false" && "${do_similar}" == "false" ]]; then
+    if [[ "${do_threshold}" == "false" && "${do_similar}" == "false" && "${do_anyname}" == "false" ]]; then
         return 0
     fi
 
@@ -82,6 +114,8 @@ cleanup_stale_offline_runners() {
     if [[ -z "${auth_token}" ]]; then
         if [[ "${do_threshold}" == "true" ]]; then
             log "warn" "CLEANUP_OFFLINE_RUNNERS=true but no PAT available -- skipping (need GITHUB_PAT or GITHUB_TOKEN)"
+        elif [[ "${do_anyname}" == "true" ]]; then
+            log "warn" "CLEANUP_OFFLINE_ANY_NAME=true but no PAT available -- skipping (need GITHUB_PAT or GITHUB_TOKEN)"
         else
             log "debug" "CLEANUP_SIMILAR_OFFLINE=true but no PAT available -- skipping similar-name sweep"
         fi
@@ -96,6 +130,24 @@ cleanup_stale_offline_runners() {
         threshold=86400
     fi
 
+    # Validate Pass C threshold with a HARD floor of 86400s (24h) but a
+    # higher *default* of 604800s (7d). The floor is the minimum-safe
+    # value -- the whole purpose of the any-name sweep is "GC dead-for-
+    # 24h+ runners regardless of who registered them" and letting an
+    # operator set this to e.g. 600 would convert it into a fleet-wide
+    # mass-delete on the next brief network blip. The 7d default is the
+    # recommended starting point because Pass C can also catch runners
+    # registered by other services in the same org/repo; 7d is the
+    # industry-standard "unambiguously dead" window. Values below the
+    # floor are clamped to 86400 with a warning.
+    local anyname_threshold="${CLEANUP_OFFLINE_ANY_NAME_AFTER:-604800}"
+    if ! [[ "${anyname_threshold}" =~ ^[0-9]+$ ]] || (( anyname_threshold < 86400 )); then
+        if [[ "${do_anyname}" == "true" ]]; then
+            log "warn" "CLEANUP_OFFLINE_ANY_NAME_AFTER='${CLEANUP_OFFLINE_ANY_NAME_AFTER:-}' invalid or below 86400 floor; clamping to 86400 (24h)"
+        fi
+        anyname_threshold=86400
+    fi
+
     local max_remove="${CLEANUP_OFFLINE_MAX:-25}"
     if ! [[ "${max_remove}" =~ ^[0-9]+$ ]] || (( max_remove < 1 )); then
         max_remove=25
@@ -107,6 +159,7 @@ cleanup_stale_offline_runners() {
     # Immediate mode defaults ON in ephemeral mode (offline ephemeral
     # runners are dead by definition) and OFF for persistent runners (so a
     # brief network blip doesn't mass-delete). Override either way.
+    # NOTE: only applies to Pass A. Pass C is always threshold-mode.
     local immediate_default="false"
     [[ "${RUNNER_EPHEMERAL:-false}" == "true" ]] && immediate_default="true"
     local immediate="${CLEANUP_OFFLINE_IMMEDIATE:-${immediate_default}}"
@@ -120,6 +173,9 @@ cleanup_stale_offline_runners() {
     fi
     if [[ "${do_similar}" == "true" ]]; then
         log "info" "Stale-runner cleanup: similar-name sweep enabled (pattern='^${RUNNER_NAME}-[0-9]+\$', require_label_match=${CLEANUP_SIMILAR_REQUIRE_LABEL_MATCH:-true})"
+    fi
+    if [[ "${do_anyname}" == "true" ]]; then
+        log "info" "Stale-runner cleanup: any-name sweep enabled (threshold=${anyname_threshold}s, regex=<all>, dry_run=${dry_run}, max=${max_remove})"
     fi
 
     local runners_url; runners_url="$(gh_api_runners_url)"
@@ -216,12 +272,12 @@ cleanup_stale_offline_runners() {
     log "info" "Stale-runner cleanup: ${offline_count} runner(s) currently offline (self='${RUNNER_NAME}' will be skipped)"
 
     # Victim selector emits TSV rows: id<TAB>name<TAB>offline_for<TAB>reason
-    # where reason is `stale` (Pass A — time threshold) or `similar`
-    # (Pass B — derived from RUNNER_NAME). `offline_for` is `-1` for
-    # similar-name hits because the threshold doesn't apply and we want
-    # the per-victim log line to read "similar" instead of a stale
-    # seconds count.
-    local victims_a="" victims_b=""
+    # where reason is `stale` (Pass A — time threshold), `similar`
+    # (Pass B — derived from RUNNER_NAME), or `anyname` (Pass C — name-
+    # agnostic 24h+ sweep). `offline_for` is `-1` for similar-name hits
+    # because the threshold doesn't apply and we want the per-victim log
+    # line to read "similar" instead of a stale seconds count.
+    local victims_a="" victims_b="" victims_c=""
 
     if [[ "${do_threshold}" == "true" ]]; then
         # Select Pass A victims. IMMEDIATE mode replaces the threshold
@@ -328,13 +384,58 @@ cleanup_stale_offline_runners() {
         fi
     fi
 
-    # Merge victim lists, dedup by id (Pass A wins on tie so the log line
-    # reports the timer-based reason). The simple `sort -u -k1,1` keeps
-    # only the first occurrence per id when fed `victims_a` then
-    # `victims_b`, since `sort -s -k1,1n` would be stable across the
-    # whole record — we want first-by-id only.
+    # ------------------------------------------------------------------
+    # Pass C — any-name age-gated sweep (CLEANUP_OFFLINE_ANY_NAME=true)
+    # ------------------------------------------------------------------
+    # Target: every offline runner (any name, any labels) that has been
+    # continuously offline for >= CLEANUP_OFFLINE_ANY_NAME_AFTER seconds
+    # (default 604800 = 7d, floor 86400 = 24h). Designed as the safe
+    # default for fleets that want "GC anything dead longer than a week"
+    # without having to author a regex.
+    #
+    # Distinct from Pass A in three ways:
+    #   1. Name regex is ignored — this pass intentionally sees ALL names.
+    #   2. IMMEDIATE mode does NOT apply — always threshold-mode. The
+    #      whole point is the 24h grace window; bypassing it would turn
+    #      this into a fleet-wide mass-delete.
+    #   3. Threshold has a hard floor of 86400s, clamped above.
+    # Self runner is still skipped. State file (timer per name) is the
+    # same as Pass A, so timers carry forward across enabling/disabling
+    # either pass.
+    if [[ "${do_anyname}" == "true" ]]; then
+        if ! victims_c="$(jq -r \
+            --argjson runners "${current_json}" \
+            --argjson now "${now}" \
+            --argjson threshold "${anyname_threshold}" \
+            --arg self_name "${RUNNER_NAME}" \
+            --argjson state "${new_state}" \
+            -n '
+                $runners
+                | map(select(.status == "offline"))
+                | map(select(.name != $self_name))
+                | map({
+                    id: .id,
+                    name: .name,
+                    offline_for: ($now - ($state[.name] // $now))
+                  })
+                | map(select(.offline_for >= $threshold))
+                | .[]
+                | "\(.id)\t\(.name)\t\(.offline_for)\tanyname"
+            ' 2>/dev/null)"; then
+            log "warn" "Stale-runner cleanup: jq failed selecting Pass C (any-name) victims -- continuing without it"
+            victims_c=""
+        fi
+    fi
+
+    # Merge victim lists, dedup by id. Order matters because the awk
+    # `!seen[$1]++` keeps the FIRST occurrence per id — Pass A wins over
+    # Pass C wins over Pass B so the per-victim log line picks the most
+    # specific reason (a runner caught by both Pass A and Pass C is
+    # reported as `stale` because that's the explicit operator-scoped
+    # rule; an any-name hit is more informative than a similar-name hit
+    # if both happen to match, which would require an unusual config).
     local combined
-    combined="$(printf '%s\n%s\n' "${victims_a}" "${victims_b}" \
+    combined="$(printf '%s\n%s\n%s\n' "${victims_a}" "${victims_c}" "${victims_b}" \
         | awk 'NF' \
         | awk -F'\t' '!seen[$1]++')"
     local victims="${combined}"
@@ -352,11 +453,12 @@ cleanup_stale_offline_runners() {
         return 0
     fi
 
-    local victim_count count_a count_b
+    local victim_count count_a count_b count_c
     victim_count="$(echo "${victims}" | wc -l | tr -d ' ')"
     count_a="$(printf '%s\n' "${victims_a}" | awk 'NF' | wc -l | tr -d ' ')"
     count_b="$(printf '%s\n' "${victims_b}" | awk 'NF' | wc -l | tr -d ' ')"
-    log "info" "Stale-runner cleanup: ${victim_count} candidate(s) selected (stale=${count_a}, similar=${count_b}), capped at max=${max_remove}"
+    count_c="$(printf '%s\n' "${victims_c}" | awk 'NF' | wc -l | tr -d ' ')"
+    log "info" "Stale-runner cleanup: ${victim_count} candidate(s) selected (stale=${count_a}, similar=${count_b}, anyname=${count_c}), capped at max=${max_remove}"
 
     local removed=0 skipped=0 failed=0 line rid rname rfor reason del_code del_body_file
     local IFS=$'\n'
@@ -370,10 +472,15 @@ cleanup_stale_offline_runners() {
         rfor="$(echo "${line}" | cut -f3)"
         reason="$(echo "${line}" | cut -f4)"
 
-        # Human-friendly suffix for the per-victim log line.
+        # Human-friendly suffix for the per-victim log line. Reason wins
+        # over IMMEDIATE because Pass C never runs in immediate mode and
+        # we want its log line to say `offline Ns (any-name)` regardless
+        # of how Pass A happens to be configured.
         local why
         if [[ "${reason}" == "similar" ]]; then
             why="similar-name leftover of '${RUNNER_NAME}'"
+        elif [[ "${reason}" == "anyname" ]]; then
+            why="offline ${rfor}s (any-name sweep)"
         elif [[ "${immediate}" == "true" ]]; then
             why="status=offline, immediate"
         else

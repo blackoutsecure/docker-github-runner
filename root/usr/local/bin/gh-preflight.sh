@@ -143,25 +143,53 @@ gh_preflight_check_api() {
 # Validate the CLEANUP_OFFLINE_RUNNERS feature gate when enabled. Skipped
 # entirely when the feature is off.
 gh_preflight_check_cleanup() {
-    [[ "${CLEANUP_OFFLINE_RUNNERS:-false}" == "true" ]] || return 0
+    local do_threshold="false" do_anyname="false"
+    [[ "${CLEANUP_OFFLINE_RUNNERS:-false}" == "true" ]] && do_threshold="true"
+    case "${CLEANUP_OFFLINE_ANY_NAME:-false}" in
+        true|TRUE|1|yes|on) do_anyname="true" ;;
+    esac
+    [[ "${do_threshold}" == "true" || "${do_anyname}" == "true" ]] || return 0
 
     # DELETE on /actions/runners/{id} requires the same scope as registration
     # (admin:org / manage_runners:enterprise / repo administration), which
     # the github-runners-scope check above already validates. We just need
     # to confirm a token is even present here.
     if [[ -z "${GITHUB_PAT:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
+        local missing_for
+        if [[ "${do_threshold}" == "true" && "${do_anyname}" == "true" ]]; then
+            missing_for="CLEANUP_OFFLINE_RUNNERS / CLEANUP_OFFLINE_ANY_NAME"
+        elif [[ "${do_threshold}" == "true" ]]; then
+            missing_for="CLEANUP_OFFLINE_RUNNERS"
+        else
+            missing_for="CLEANUP_OFFLINE_ANY_NAME"
+        fi
         preflight FAIL "cleanup-offline-runners" \
-            "CLEANUP_OFFLINE_RUNNERS=true but no GITHUB_PAT / GITHUB_TOKEN -- cleanup cannot call DELETE without an authenticated token"
+            "${missing_for}=true but no GITHUB_PAT / GITHUB_TOKEN -- cleanup cannot call DELETE without an authenticated token"
     else
-        preflight OK "cleanup-offline-runners" "enabled"
+        local enabled_passes=""
+        [[ "${do_threshold}" == "true" ]] && enabled_passes="threshold"
+        [[ "${do_anyname}" == "true" ]] && enabled_passes="${enabled_passes:+${enabled_passes}+}any-name"
+        preflight OK "cleanup-offline-runners" "enabled (${enabled_passes})"
     fi
 
-    local cleanup_after="${CLEANUP_OFFLINE_AFTER:-86400}"
-    if ! [[ "${cleanup_after}" =~ ^[0-9]+$ ]] || (( cleanup_after < 300 )); then
-        preflight WARN "cleanup-offline-after" \
-            "CLEANUP_OFFLINE_AFTER='${CLEANUP_OFFLINE_AFTER:-}' invalid (must be integer >=300); will use default 86400"
-    else
-        preflight OK "cleanup-offline-after" "${cleanup_after}s"
+    if [[ "${do_threshold}" == "true" ]]; then
+        local cleanup_after="${CLEANUP_OFFLINE_AFTER:-86400}"
+        if ! [[ "${cleanup_after}" =~ ^[0-9]+$ ]] || (( cleanup_after < 300 )); then
+            preflight WARN "cleanup-offline-after" \
+                "CLEANUP_OFFLINE_AFTER='${CLEANUP_OFFLINE_AFTER:-}' invalid (must be integer >=300); will use default 86400"
+        else
+            preflight OK "cleanup-offline-after" "${cleanup_after}s"
+        fi
+    fi
+
+    if [[ "${do_anyname}" == "true" ]]; then
+        local anyname_after="${CLEANUP_OFFLINE_ANY_NAME_AFTER:-604800}"
+        if ! [[ "${anyname_after}" =~ ^[0-9]+$ ]] || (( anyname_after < 86400 )); then
+            preflight WARN "cleanup-anyname-after" \
+                "CLEANUP_OFFLINE_ANY_NAME_AFTER='${CLEANUP_OFFLINE_ANY_NAME_AFTER:-}' invalid or below 86400s (24h) floor; will clamp to 86400"
+        else
+            preflight OK "cleanup-anyname-after" "${anyname_after}s"
+        fi
     fi
 
     if [[ -n "${CLEANUP_OFFLINE_NAME_REGEX:-}" ]]; then
