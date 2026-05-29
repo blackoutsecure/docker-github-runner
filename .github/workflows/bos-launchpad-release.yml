@@ -53,7 +53,11 @@ on:
       # The consolidated `security_scan` stage is ON by default for
       # push + dispatch events. Skipped on `schedule` (cron only polls
       # upstream — source hasn't changed, so re-scanning every 6h is
-      # wasteful). Advisory only: never gates docker/balena release.
+      # wasteful). Gates the release by default: error-level findings
+      # skip the docker/balena stages (override via
+      # `security_scan_blocks_release: false` on the launchpad call
+      # below, or set `security_scan_fail_on: never` to keep scan
+      # always-green and never gate).
       stage_security_scan:
         description: 'Stage: consolidated security scan (kit composite + CodeQL)'
         type: boolean
@@ -153,11 +157,17 @@ jobs:
         Repository: https://github.com/${{ github.repository }}
         Upstream application: https://github.com/actions/runner
 
-      # ---- Consolidated security scan (advisory) ---------------------
+      # ---- Consolidated security scan ---------------------------------
       # The shell-script payload under `root/` is covered by the kit
-      # composite's bundled shellcheck. Skipped on `schedule` since
+      # composite's bundled shellcheck; workflow YAML is covered by
+      # actionlint + CodeQL default setup. Skipped on `schedule` since
       # source doesn't change between upstream-version polls. Findings
-      # surface in the Security tab but never block docker/balena.
+      # surface in the Security tab AND (by default) gate the
+      # docker/balena release: error-level results from the kit
+      # composite skip the release job (hub default
+      # `security_scan_fail_on: fail` + `security_scan_blocks_release:
+      # true`). Either knob can be flipped here to opt back into
+      # advisory-only behaviour.
       #
       # CodeQL coverage of the workflow YAML (`actions` language) is
       # delegated to GitHub's first-party **default setup** (Settings →
@@ -175,7 +185,6 @@ jobs:
       # (posture / actionlint / gitleaks / shellcheck) still runs and
       # uploads under its own SARIF category, independent of CodeQL.
       enable_security_scan:               ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.stage_security_scan) }}
-      security_scan_fail_on:              never
       security_scan_enable_kit_composite: true
       security_scan_enable_posture:       true
       security_scan_enable_scanners:      true
