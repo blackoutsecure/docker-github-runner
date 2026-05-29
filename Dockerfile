@@ -32,6 +32,7 @@ RUN apt-get update && \
         npm \
         python3 \
         python3-pip \
+        python3-yaml \
         shellcheck \
         sudo \
         unzip \
