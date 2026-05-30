@@ -83,9 +83,16 @@ services:
       - AUDIT_WRITE
     tmpfs:
       - /run:exec,size=64m
-      - /tmp:exec,size=2g,mode=1777
+      # /tmp lives in RAM via tmpfs; size to your job's scratch needs.
+      # 1g is a comfortable default for typical CI; raise on devices
+      # with abundant RAM, lower (e.g. 512m) on Pi 3B+ / Pi Zero.
+      - /tmp:exec,size=1g,mode=1777
       - /var/log:size=32m
       - /config:size=128m,mode=1777
     stop_grace_period: 30s
-    shm_size: 1gb
+    # /dev/shm is only used by IPC-heavy workloads (Chrome headless,
+    # some scientific Python). Standard CI (npm/pip/docker buildx)
+    # does not touch it, so 256m is plenty and keeps RAM free for the
+    # actual build. Bump to 1gb+ only if a specific job needs it.
+    shm_size: 256m
     restart: always
