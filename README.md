@@ -56,6 +56,7 @@ Links: [Docker Hub](https://hub.docker.com/r/blackoutsecure/github-runner) · [B
       - [Custom packages / init script (escape hatch)](#custom-packages--init-script-escape-hatch)
       - [Process / shutdown](#process--shutdown)
     - [Autoscaler variables](#autoscaler-variables)
+      - [CPU quota formula (optional hard cap)](#cpu-quota-formula-optional-hard-cap)
     - [Volumes](#volumes)
   - [Configuration](#configuration)
     - [Registration tokens](#registration-tokens)
@@ -695,41 +696,75 @@ See [Stale offline runner cleanup](#stale-offline-runner-cleanup) for the full d
 
 ### Autoscaler variables
 
-Used by the `gh-runner-scaler` sidecar service (see [Advanced: Dynamic scaling](#advanced-dynamic-scaling)):
+Used by the `gh-runner-scaler` sidecar service (see [Advanced: Dynamic scaling](#advanced-dynamic-scaling)).
+
+**Hot-reload semantics.** Variables marked with **🔄** in the tables below are re-read by the scaler at the top of every `SCALE_INTERVAL` tick. Changing them in your orchestrator (e.g. a Balena fleet/device variable) applies on the **next polling cycle without restarting the container** — handy because Balena's auto-restart-on-env-change can take ~30 s and you may want a fleet-wide policy change to settle faster. Variables without 🔄 are evaluated once at process start; an orchestrator-level restart is required (Balena triggers this automatically when its env vars change).
 
 **Common to all backends:**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SCALE_BACKEND` | `compose` | Scaling backend: `compose` \| `exec` \| `emit` |
-| `SCALE_MIN` | `1` | Minimum runners to keep alive |
-| `SCALE_MAX` | `1` | Maximum runners allowed |
-| `SCALE_MODE` | `auto` | `auto` = scale on demand, `fixed` = always run `SCALE_MAX` |
-| `SCALE_INTERVAL` | `30` | Seconds between scaling checks |
-| `SCALE_COOLDOWN` | `60` | Seconds between scale events |
-| `SCALE_UP_THRESHOLD` | `80` | Scale up when ≥N% of runners are busy |
-| `SCALE_DOWN_THRESHOLD` | `20` | Scale down when ≤N% of runners are busy |
+| `SCALE_BACKEND` | `compose` | Scaling backend: `compose` \| `exec` \| `emit`. Startup-only — switching backends mid-loop would be unsafe (it selects the whole code path and validates emit-file/exec prerequisites once at start). |
+| `SCALE_MIN` 🔄 | `1` | Minimum runners to keep alive. Clamped to `>= 1`. |
+| `SCALE_MAX` 🔄 | `1` | Maximum runners allowed. Clamped to `>= SCALE_MIN`. |
+| `SCALE_MODE` 🔄 | `auto` | `auto` = scale on demand, `fixed` = always run `SCALE_MAX`. Anything else falls back to `auto`. **Note:** flipping `fixed` ↔ `auto` mid-loop is *not* honoured — the branch is selected at startup; the supervisor restart will pick up a true mode switch. |
+| `SCALE_INTERVAL` | `30` | Seconds between scaling checks. Startup-only — the in-flight `sleep` is already scheduled, so changes only matter after a restart anyway. |
+| `SCALE_COOLDOWN` 🔄 | `60` | Seconds between scale events. |
+| `SCALE_UP_THRESHOLD` 🔄 | `80` | Scale up when ≥N% of runners are busy. Clamped to `0..100`. |
+| `SCALE_DOWN_THRESHOLD` 🔄 | `20` | Scale down when ≤N% of runners are busy. Clamped to `0..SCALE_UP_THRESHOLD`. |
+| `RUNNER_SCOPE_LABELS` 🔄 | _empty_ | Comma-separated required label set — case-insensitive superset match. Scopes a shared `RUNNER_URL` (org / enterprise) to a specific fleet's runners. Re-read each cycle, so a typo in the dashboard can be corrected without restart. |
+| `RUNNER_SCOPE_NAME_REGEX` 🔄 | _empty_ | jq regex matched against runner names — additional scope filter. **Invalid regex no longer aborts startup**: the offending regex is logged at `warn` and the filter is dropped for that cycle so the sidecar keeps running while you fix the dashboard value. |
 
 **Compose backend (`SCALE_BACKEND=compose`):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `COMPOSE_SERVICE` | `gh-runner` | Name of the runner compose service to scale |
-| `COMPOSE_PROJECT` | _empty_ | Optional compose project name |
-| `COMPOSE_FILE` | `docker-compose.yml` | Compose file path (mount it into the scaler) |
+| `COMPOSE_SERVICE` | `gh-runner` | Name of the runner compose service to scale. Startup-only (used in pre-computed compose arg array). |
+| `COMPOSE_PROJECT` | _empty_ | Optional compose project name. Startup-only. |
+| `COMPOSE_FILE` | `docker-compose.yml` | Compose file path (mount it into the scaler). Startup-only. |
 
 **Exec backend (`SCALE_BACKEND=exec`):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SCALE_EXEC` | _required_ | Path or shell command invoked with verbs `count`, `scale <N>`, and (optionally) `remove <name>...` |
-| `SCALE_EXEC_SUPPORTS_REMOVE` | `false` | Set `true` if your wrapper implements the `remove <name>...` verb for targeted graceful scale-down |
+| `SCALE_EXEC` | _required_ | Path or shell command invoked with verbs `count`, `scale <N>`, and (optionally) `remove <name>...`. Startup-only. |
+| `SCALE_EXEC_SUPPORTS_REMOVE` | `false` | Set `true` if your wrapper implements the `remove <name>...` verb for targeted graceful scale-down. Startup-only. |
 
 **Emit backend (`SCALE_BACKEND=emit`):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SCALE_EMIT_FILE` | `/scaler/state.json` | Path to write the JSON state file each interval. The image pre-creates `/scaler` (mode 0700); override to redirect to a bind-mounted volume shared with a consumer |
+| `SCALE_EMIT_FILE` | `/scaler/state.json` | Path to write the JSON state file each interval. The image pre-creates `/scaler` (mode 0700); override to redirect to a bind-mounted volume shared with a consumer. Startup-only (the parent dir is validated at start). |
+
+#### CPU quota formula (optional hard cap)
+
+The sidecar runs **one `curl` + one `jq` per `SCALE_INTERVAL`** and sleeps the rest of the cycle, so on every device family from Raspberry Pi 3B+ upward the kernel CFS scheduler shares CPU fairly between the scaler and the runner peers without any explicit cap. **The shipped compose files do not set a `cpu_quota`** — they rely on this fair-share. If you are running on a particularly tight device or want a defence-in-depth hard cap, add one line under the `gh-runner-scaler` service:
+
+```yaml
+    cpu_quota: ${SCALER_CPU_QUOTA:-10000}    # compose v2.4 (Balena)
+```
+
+or, for compose v3 / Docker Swarm / Kubernetes:
+
+```yaml
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"                       # 10% of one core
+```
+
+The empirically-anchored formula (cgroup CFS `cpu_period` is the default `100000` µs, so `cpu_quota=10000` = 10 % of one core):
+
+> `cpu_quota_us = clamp( round(10000 × 60 / SCALE_INTERVAL), 5000, 50000 )`
+
+| `SCALE_INTERVAL` | `cpu_quota` | % of one core |
+| --- | --- | --- |
+| 120 s | 5 000 (floor) | 5 % |
+| 60 s | 10 000 | 10 % |
+| 30 s | 20 000 | 20 % |
+| 10 s | 50 000 (ceiling) | 50 % |
+
+Set `SCALER_CPU_QUOTA` per-fleet or per-device in your orchestrator dashboard to apply the formula's output without touching the compose file. The 5 000 floor leaves enough headroom for the `curl`/`jq` burst to finish in one period; the 50 000 ceiling exists because beyond it the kernel's fair-share is already adequate and the hard cap stops being useful.
 
 ### Volumes
 

@@ -97,28 +97,44 @@
 set -uo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
+# Startup-only (changing these mid-loop is unsafe — they pick the whole code
+# path, drive the loop sleep, or validate filesystem mounts that can't be
+# moved at runtime). A Balena fleet/device variable change to any of these
+# still applies — the supervisor restarts the scaler service (~30 s) and
+# the new value takes effect on the next start.
 SCALE_BACKEND="${SCALE_BACKEND:-compose}"
-SCALE_MIN="${SCALE_MIN:-1}"
-SCALE_MAX="${SCALE_MAX:-1}"
-SCALE_MODE="${SCALE_MODE:-auto}"
 SCALE_INTERVAL="${SCALE_INTERVAL:-30}"
-SCALE_COOLDOWN="${SCALE_COOLDOWN:-60}"
-SCALE_UP_THRESHOLD="${SCALE_UP_THRESHOLD:-80}"
-SCALE_DOWN_THRESHOLD="${SCALE_DOWN_THRESHOLD:-20}"
-# Compose backend
+# Compose backend (startup-only)
 COMPOSE_SERVICE="${COMPOSE_SERVICE:-gh-runner}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
-# Exec backend
+# Exec backend (startup-only)
 SCALE_EXEC="${SCALE_EXEC:-}"
 SCALE_EXEC_SUPPORTS_REMOVE="${SCALE_EXEC_SUPPORTS_REMOVE:-false}"
-# Emit backend
+# Emit backend (startup-only)
 # Default to /scaler/state.json -- the Dockerfile pre-creates /scaler
 # with mode 0700 so this Just Works without any extra compose config
 # when SCALE_BACKEND=emit. Override to redirect to a bind-mounted
 # volume shared with a workflow / sidecar that consumes the state.
 SCALE_EMIT_FILE="${SCALE_EMIT_FILE:-/scaler/state.json}"
-# Per-fleet scope filters
+
+# ── Pure-policy defaults (re-read every cycle) ───────────────────────────────
+# The variables in this block, the scope filters below, and the threshold
+# defaults are re-read at the top of each loop iteration via
+# `_refresh_policy_vars()` so a Balena dashboard change (or any other
+# external env mutation visible to PID 1) takes effect on the NEXT
+# SCALE_INTERVAL tick without waiting for the supervisor restart Balena
+# auto-triggers on env-var changes. The startup assignments below give
+# the initial values; `_refresh_policy_vars` re-applies the same
+# `${VAR:-default}` + clamp logic each cycle and logs a one-line diff if
+# anything changed.
+SCALE_MIN="${SCALE_MIN:-1}"
+SCALE_MAX="${SCALE_MAX:-1}"
+SCALE_MODE="${SCALE_MODE:-auto}"
+SCALE_COOLDOWN="${SCALE_COOLDOWN:-60}"
+SCALE_UP_THRESHOLD="${SCALE_UP_THRESHOLD:-80}"
+SCALE_DOWN_THRESHOLD="${SCALE_DOWN_THRESHOLD:-20}"
+# Per-fleet scope filters (also re-read each cycle)
 RUNNER_SCOPE_LABELS="${RUNNER_SCOPE_LABELS:-}"
 RUNNER_SCOPE_NAME_REGEX="${RUNNER_SCOPE_NAME_REGEX:-}"
 
@@ -231,15 +247,131 @@ if [[ -z "${RUNNER_URL:-}" ]]; then
     exit 1
 fi
 
-if [[ "${SCALE_MIN}" -lt 1 ]]; then
-    log "warn" "SCALE_MIN must be >= 1, setting to 1"
-    SCALE_MIN=1
+if [[ "${SCALE_INTERVAL}" -lt 1 ]] 2>/dev/null; then
+    log "warn" "SCALE_INTERVAL must be >= 1, setting to 1"
+    SCALE_INTERVAL=1
 fi
 
-if [[ "${SCALE_MAX}" -lt "${SCALE_MIN}" ]]; then
-    log "warn" "SCALE_MAX (${SCALE_MAX}) < SCALE_MIN (${SCALE_MIN}), setting SCALE_MAX=${SCALE_MIN}"
-    SCALE_MAX="${SCALE_MIN}"
-fi
+# ---------------------------------------------------------------------------
+# Pure-policy refresher
+#
+# Re-reads the SCALE_* policy knobs and per-fleet scope filters from the
+# current environment, re-applies clamping/normalization, and (on change)
+# logs a one-line diff so operators see when a Balena dashboard tweak
+# took effect mid-loop. Idempotent: safe to call once at startup and again
+# at the top of every scaling cycle.
+#
+# Strictly off-limits for this helper (they live above as startup-only):
+#   SCALE_BACKEND      — selects whole code path (compose/exec/emit
+#                        validation + emit-file mount check happen once)
+#   SCALE_INTERVAL     — the in-flight `sleep` is already scheduled; a
+#                        change to the next sleep only takes effect on
+#                        the cycle after that, so just defer to the
+#                        supervisor restart Balena triggers anyway
+#   SCALE_EMIT_FILE / SCALE_EXEC / SCALE_EXEC_SUPPORTS_REMOVE / COMPOSE_*
+#                      — validated at startup or used in pre-computed
+#                        arg arrays; restart-on-change is correct
+#   RUNNER_URL / GITHUB_PAT — security-sensitive; restart is appropriate
+#
+# Vars covered (all are pure policy with zero side effects when re-read):
+#   SCALE_MIN, SCALE_MAX, SCALE_MODE, SCALE_COOLDOWN,
+#   SCALE_UP_THRESHOLD, SCALE_DOWN_THRESHOLD,
+#   RUNNER_SCOPE_LABELS, RUNNER_SCOPE_NAME_REGEX
+# ---------------------------------------------------------------------------
+
+# Module-global snapshot for change detection. Initialized empty so the
+# first call logs the resolved values (operator confirmation that the
+# refresher saw the startup env). After that we only log on actual change.
+_POLICY_VARS_SNAPSHOT=""
+_SCOPE_LABELS_JSON='[]'
+
+_refresh_policy_vars() {
+    # --- SCALE_MIN ---
+    local new_min="${SCALE_MIN:-1}"
+    if ! [[ "${new_min}" =~ ^[0-9]+$ ]] || [[ "${new_min}" -lt 1 ]]; then
+        new_min=1
+    fi
+    # --- SCALE_MAX (>= SCALE_MIN) ---
+    local new_max="${SCALE_MAX:-1}"
+    if ! [[ "${new_max}" =~ ^[0-9]+$ ]] || [[ "${new_max}" -lt 1 ]]; then
+        new_max=1
+    fi
+    if [[ "${new_max}" -lt "${new_min}" ]]; then
+        new_max="${new_min}"
+    fi
+    # --- SCALE_MODE (auto|fixed; anything else falls back to auto) ---
+    local new_mode="${SCALE_MODE:-auto}"
+    case "${new_mode}" in
+        auto|fixed) : ;;
+        *)          new_mode="auto" ;;
+    esac
+    # --- SCALE_COOLDOWN ---
+    local new_cooldown="${SCALE_COOLDOWN:-60}"
+    if ! [[ "${new_cooldown}" =~ ^[0-9]+$ ]]; then
+        new_cooldown=60
+    fi
+    # --- SCALE_UP_THRESHOLD (0..100 inclusive) ---
+    local new_up="${SCALE_UP_THRESHOLD:-80}"
+    if ! [[ "${new_up}" =~ ^[0-9]+$ ]] || [[ "${new_up}" -gt 100 ]]; then
+        new_up=80
+    fi
+    # --- SCALE_DOWN_THRESHOLD (0..SCALE_UP_THRESHOLD) ---
+    local new_down="${SCALE_DOWN_THRESHOLD:-20}"
+    if ! [[ "${new_down}" =~ ^[0-9]+$ ]] || [[ "${new_down}" -gt "${new_up}" ]]; then
+        new_down=20
+        if [[ "${new_down}" -gt "${new_up}" ]]; then
+            new_down="${new_up}"
+        fi
+    fi
+    # --- Scope: name regex (validate against jq; bad regex → drop filter) ---
+    local new_regex="${RUNNER_SCOPE_NAME_REGEX:-}"
+    if [[ -n "${new_regex}" ]]; then
+        if ! echo "x" | jq -Rr --arg r "${new_regex}" '. | test($r)' >/dev/null 2>&1; then
+            log "warn" "RUNNER_SCOPE_NAME_REGEX='${new_regex}' is not a valid jq regex — ignoring filter for this cycle"
+            new_regex=""
+        fi
+    fi
+    # --- Scope: required label set (normalize → JSON array of lowercased) ---
+    local new_labels_json='[]'
+    if [[ -n "${RUNNER_SCOPE_LABELS:-}" ]]; then
+        new_labels_json="$(printf '%s' "${RUNNER_SCOPE_LABELS}" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | awk 'NF' \
+            | tr '[:upper:]' '[:lower:]' \
+            | jq -R . | jq -c -s '.')"
+        if [[ -z "${new_labels_json}" || "${new_labels_json}" == "null" ]]; then
+            new_labels_json='[]'
+        fi
+    fi
+
+    # Snapshot for change detection — single | -delimited line so we
+    # don't have to compare 8 vars individually each cycle.
+    local snap="${new_min}|${new_max}|${new_mode}|${new_cooldown}|${new_up}|${new_down}|${new_labels_json}|${new_regex}"
+    if [[ "${snap}" != "${_POLICY_VARS_SNAPSHOT}" ]]; then
+        if [[ -z "${_POLICY_VARS_SNAPSHOT}" ]]; then
+            log "info" "policy: MIN=${new_min} MAX=${new_max} MODE=${new_mode} COOLDOWN=${new_cooldown}s UP=${new_up}% DOWN=${new_down}% scope_labels=${new_labels_json} scope_name_regex='${new_regex}'"
+        else
+            log "info" "policy changed: MIN=${SCALE_MIN}->${new_min} MAX=${SCALE_MAX}->${new_max} MODE=${SCALE_MODE}->${new_mode} COOLDOWN=${SCALE_COOLDOWN}->${new_cooldown}s UP=${SCALE_UP_THRESHOLD}->${new_up}% DOWN=${SCALE_DOWN_THRESHOLD}->${new_down}% scope_labels=${_SCOPE_LABELS_JSON}->${new_labels_json} scope_name_regex='${RUNNER_SCOPE_NAME_REGEX}'->'${new_regex}'"
+        fi
+        _POLICY_VARS_SNAPSHOT="${snap}"
+    fi
+
+    # Commit normalized values back to the module globals every cycle.
+    SCALE_MIN="${new_min}"
+    SCALE_MAX="${new_max}"
+    SCALE_MODE="${new_mode}"
+    SCALE_COOLDOWN="${new_cooldown}"
+    SCALE_UP_THRESHOLD="${new_up}"
+    SCALE_DOWN_THRESHOLD="${new_down}"
+    RUNNER_SCOPE_NAME_REGEX="${new_regex}"
+    _SCOPE_LABELS_JSON="${new_labels_json}"
+}
+
+# Initial population: runs ONCE before the loop so the validation/clamping
+# is applied to startup-time values and the snapshot is seeded. Cycle-time
+# calls happen at the top of each scaling loop iteration below.
+_refresh_policy_vars
 
 case "${SCALE_BACKEND}" in
     exec)
@@ -283,29 +415,11 @@ case "${SCALE_BACKEND}" in
         ;;
 esac
 
-# Validate the scope regex compiles before entering the loop, so a typo
-# becomes a startup fatal instead of a per-cycle silent no-op.
-if [[ -n "${RUNNER_SCOPE_NAME_REGEX}" ]]; then
-    if ! echo "x" | jq -Rr --arg r "${RUNNER_SCOPE_NAME_REGEX}" '. | test($r)' >/dev/null 2>&1; then
-        log "fatal" "RUNNER_SCOPE_NAME_REGEX='${RUNNER_SCOPE_NAME_REGEX}' is not a valid jq regex"
-        exit 1
-    fi
-fi
-
-# Normalize the required-label set ONCE: trim, drop empties, lowercase,
-# JSON-encode as a string array. Empty array = no label filter.
-_SCOPE_LABELS_JSON='[]'
-if [[ -n "${RUNNER_SCOPE_LABELS}" ]]; then
-    _SCOPE_LABELS_JSON="$(printf '%s' "${RUNNER_SCOPE_LABELS}" \
-        | tr ',' '\n' \
-        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-        | awk 'NF' \
-        | tr '[:upper:]' '[:lower:]' \
-        | jq -R . | jq -c -s '.')"
-    if [[ -z "${_SCOPE_LABELS_JSON}" || "${_SCOPE_LABELS_JSON}" == "null" ]]; then
-        _SCOPE_LABELS_JSON='[]'
-    fi
-fi
+# Scope regex / labels validation + `_SCOPE_LABELS_JSON` normalization
+# both moved up into `_refresh_policy_vars()` (callable each cycle).
+# Bad regex no longer aborts startup — it now drops the filter for that
+# cycle with a warn log, so a typo in the Balena dashboard is recoverable
+# without losing the running sidecar.
 
 # Pre-compute compose CLI args once (never change at runtime).
 COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
@@ -823,6 +937,16 @@ if [[ "${SCALE_MODE}" == "fixed" ]]; then
     while true; do
         sleep "${SCALE_INTERVAL}"
 
+        # Re-read policy vars so a Balena dashboard change to SCALE_MIN/MAX
+        # etc. applies on the next tick. In fixed mode SCALE_MAX is the
+        # interesting one (target replica count); a mid-flight bump from 3
+        # to 5 will be applied by the `current != SCALE_MAX` correction
+        # block below within ONE cycle. SCALE_MODE flipping fixed->auto
+        # is NOT honoured mid-loop on purpose — that's a structural change
+        # and the supervisor restart Balena auto-triggers will pick it up
+        # cleanly via the SCALE_MODE branch above.
+        _refresh_policy_vars
+
         if [[ "${SCALE_BACKEND}" == "emit" ]]; then
             # Emit mode: publish state every cycle. No replica enforcement.
             if refresh_runners_cache; then
@@ -851,6 +975,14 @@ backend_scale_to "${SCALE_MIN}"
 
 while true; do
     sleep "${SCALE_INTERVAL}"
+
+    # Re-read pure-policy vars (SCALE_MIN/MAX/MODE/COOLDOWN/UP/DOWN +
+    # RUNNER_SCOPE_*) so a Balena dashboard tweak applies on the next
+    # tick without waiting for the supervisor restart. Startup-only vars
+    # (SCALE_BACKEND, SCALE_INTERVAL, SCALE_EMIT_FILE, SCALE_EXEC,
+    # COMPOSE_*, RUNNER_URL, GITHUB_PAT) deliberately stay snapshotted
+    # at process start — see `_refresh_policy_vars` header for why.
+    _refresh_policy_vars
 
     NOW="$(date +%s)"
 
