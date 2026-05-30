@@ -16,12 +16,13 @@
 set -euo pipefail
 
 # Shared libraries (load first; helpers depend on log/banner functions).
+# LOG_TAG must be set BEFORE sourcing log-functions.sh: the library
+# checks for it at source time and warns "unknown" otherwise.
+LOG_TAG="init-gh-runner-config"
 # shellcheck disable=SC1091
 . /usr/local/bin/log-functions.sh
 # shellcheck disable=SC1091
 . /usr/local/bin/banner-functions.sh
-
-LOG_TAG="init-gh-runner-config"
 
 # shellcheck disable=SC1091
 . /usr/local/bin/gh-config.sh

@@ -10,9 +10,11 @@ cd /opt/runner-bin
 # line with its own `<ts> svc-gh-runner[runner]:` header. That's why
 # Runner.Listener output gets prefixed by awk (it's unstructured), but
 # our own startup messages use log() for the canonical format.
+# LOG_TAG must be set BEFORE sourcing log-functions.sh: the library
+# checks for it at source time and warns "unknown" otherwise.
+LOG_TAG="svc-gh-runner"
 # shellcheck disable=SC1091
 . /usr/local/bin/log-functions.sh
-LOG_TAG="svc-gh-runner"
 
 # Emit and flush before any pipeline setup so the operator can see the
 # longrun has actually been started by s6 (otherwise a kill in the next

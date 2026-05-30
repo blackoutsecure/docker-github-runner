@@ -34,9 +34,11 @@
 #
 set -uo pipefail
 
+# LOG_TAG must be set BEFORE sourcing log-functions.sh: the library
+# checks for it at source time and warns "unknown" otherwise.
+LOG_TAG="init-sudoers-config"
 # shellcheck disable=SC1091
 . /usr/local/bin/log-functions.sh
-LOG_TAG="init-sudoers-config"
 
 SUDOERS_FILE="/etc/sudoers.d/10-abc-nopasswd"
 SUDOERS_CONTENT='abc ALL=(ALL) NOPASSWD: ALL'

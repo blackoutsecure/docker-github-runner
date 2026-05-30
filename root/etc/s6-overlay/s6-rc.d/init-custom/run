@@ -19,9 +19,11 @@
 #
 set -uo pipefail
 
+# LOG_TAG must be set BEFORE sourcing log-functions.sh: the library
+# checks for it at source time and warns "unknown" otherwise.
+LOG_TAG="init-custom"
 # shellcheck disable=SC1091
 . /usr/local/bin/log-functions.sh
-LOG_TAG="init-custom"
 
 # Normalize: trim whitespace and treat whitespace-only values as unset, so a
 # stripped-out compose template like "   " doesn't accidentally enable us.

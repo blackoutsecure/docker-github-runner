@@ -904,7 +904,9 @@ _log_status_banner() {
     banner_kv "info" "Backend"         "${SCALE_BACKEND}"
     banner_kv "info" "Mode"            "${SCALE_MODE}"
     if [[ "${SCALE_BACKEND}" == "emit" ]]; then
-        banner_kv "info" "Replicas"    "${CURRENT} (managed externally; min=${SCALE_MIN} max=${SCALE_MAX})"
+        # emit doesn't manage replicas itself -- the leading CURRENT was
+        # printed as 0 here historically, which was misleading.
+        banner_kv "info" "Replicas"    "managed externally (min=${SCALE_MIN} max=${SCALE_MAX}; target written to ${SCALE_EMIT_FILE})"
     else
         banner_kv "info" "Replicas"    "${CURRENT} / max ${SCALE_MAX} (min ${SCALE_MIN})"
     fi

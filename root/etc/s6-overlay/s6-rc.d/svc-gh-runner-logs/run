@@ -18,6 +18,10 @@
 #
 set -uo pipefail
 
+# LOG_TAG must be set BEFORE sourcing log-functions.sh: the library
+# checks for it at source time and warns "unknown" otherwise.
+LOG_TAG="svc-gh-runner-logs"
+
 # shellcheck disable=SC1091
 . /usr/local/bin/log-functions.sh
 # shellcheck disable=SC1091
