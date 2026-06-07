@@ -34,7 +34,7 @@ on:
       - '.github/upstream/**'
       - 'bos-launchpad-config.json'
       - 'bos-managed-files.yaml'
-      - '.github/workflows/bos-universal-kicker.yml'
+      - '.github/workflows/bos-universal-launchpad.yml'
   workflow_dispatch:
     inputs:
       force_run:
