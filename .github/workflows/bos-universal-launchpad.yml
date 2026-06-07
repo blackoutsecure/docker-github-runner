@@ -1,7 +1,3 @@
-# Managed by https://github.com/blackoutsecure/bos-automation-hub —
-# do not edit. To modify, update the `bos_launchpad` service in
-# .github/actions/sync-managed-files/sync.py.
-#
 # Blackout Secure Launchpad — universal kicker (hub-managed).
 # Customize via `bos-launchpad-config.json` (repo root), not this file.
 # Schema docs: https://github.com/blackoutsecure/bos-automation-hub
@@ -53,7 +49,10 @@ permissions:
 jobs:
   parse-config:
     name: Parse launchpad config
-    runs-on: ubuntu-latest
+    # Resolve runner from org-shared `vars.DEFAULT_RUNNER` when set,
+    # supporting both bare label and JSON-array formats. Fallback to
+    # `ubuntu-latest` if the variable is not defined in the consumer.
+    runs-on: ${{ fromJSON(startsWith(vars.DEFAULT_RUNNER || 'ubuntu-latest', '[') && (vars.DEFAULT_RUNNER || 'ubuntu-latest') || format('"{0}"', vars.DEFAULT_RUNNER || 'ubuntu-latest')) }}
     timeout-minutes: 2
     outputs:
       cfg: ${{ steps.read.outputs.cfg }}
