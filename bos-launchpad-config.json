@@ -1,0 +1,11 @@
+{
+  "sync_files": {
+    "services": [
+      "common",
+      "docker",
+      "balena",
+      "logger",
+      "lf_line_endings"
+    ]
+  }
+}
