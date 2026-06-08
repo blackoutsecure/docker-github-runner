@@ -1,0 +1,11 @@
+# Central ShellCheck defaults for Blackout Secure repositories.
+#
+# Composite action `run:` blocks are executed by GitHub Actions with
+# bash. We keep shellcheck aligned with that runtime.
+shell=bash
+
+# SC2016: GitHub expressions (`${{ ... }}`) in single quotes are
+# intentional in workflow/composite snippets.
+# SC1091: sourced relative helper files are resolved at runtime.
+disable=SC2016,SC1091
+external-sources=true
